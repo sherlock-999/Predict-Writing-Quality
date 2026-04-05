@@ -1,0 +1,31 @@
+# Data — too large for version control
+data/
+
+# Model weights — regenerate by running train_lgbm.py
+models/
+
+# Generated outputs
+eda_plots/
+lgbm_plots/
+submission.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environments
+.env
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
