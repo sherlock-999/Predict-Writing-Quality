@@ -20,6 +20,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_squared_error
+from features import compute_features, FEATURE_COLS, CATEGORIES, CAT_PALETTE
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR   = os.path.join(os.path.dirname(__file__), 'data')
@@ -27,128 +28,16 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'lgbm_plots')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # =============================================================================
-# SECTION 1 – FEATURE ENGINEERING  (mirrors eda.py)
+# SECTION 1 – FEATURE ENGINEERING
 # =============================================================================
 print("Loading data...")
 logs   = pd.read_csv(os.path.join(DATA_DIR, 'train_logs.csv'))
 scores = pd.read_csv(os.path.join(DATA_DIR, 'train_scores.csv'))
-logs   = logs.sort_values(['id', 'event_id']).reset_index(drop=True)
-logs['iki'] = logs.groupby('id')['down_time'].diff()
 
-
-def wpm_in_window(essay, t_start, t_end):
-    """Words per minute added in the time window [t_start, t_end] (ms)."""
-    mask    = (essay['down_time'] >= t_start) & (essay['down_time'] <= t_end)
-    segment = essay[mask]
-    if len(segment) == 0:
-        return 0.0
-    wc_start = essay.loc[essay['down_time'] < t_start, 'word_count'].max()
-    wc_start = wc_start if pd.notna(wc_start) else 0
-    words    = max(segment['word_count'].max() - wc_start, 0)
-    minutes  = (t_end - t_start) / 60_000
-    return (words / minutes) if minutes > 0 else 0.0
-
-
-rows = []
 print("Computing per-essay features...")
-for essay_id, essay in logs.groupby('id'):
-    essay    = essay.reset_index(drop=True)
-    n        = len(essay)
-    gaps     = essay.loc[essay['activity'] == 'Input', 'iki'].dropna()
-    all_gaps = essay['iki'].dropna()
-
-    # ── VOLUME ────────────────────────────────────────────────────────────────
-    # final_word_count : max word_count in session — length of finished essay
-    # total_events     : total log rows — overall amount of writing activity
-    final_word_count = essay['word_count'].max()
-    total_events     = n
-
-    # ── SPEED & FLUENCY ───────────────────────────────────────────────────────
-    # median_iki_ms : median gap (ms) between Input keystrokes; lower = more fluent
-    # iki_std       : std of IKI; higher = more uneven, hesitant rhythm
-    # typing_wpm    : words per active minute (session time minus pauses >2 s)
-    median_iki_ms = gaps.median() if len(gaps) > 0 else np.nan
-    iki_std       = gaps.std()    if len(gaps) > 0 else np.nan
-
-    total_time_ms  = essay['down_time'].max() - essay['down_time'].min()
-    active_time_ms = max(total_time_ms - all_gaps[all_gaps > 2_000].sum(), 1)
-    typing_wpm     = final_word_count / (active_time_ms / 60_000)
-
-    # ── PAUSING ───────────────────────────────────────────────────────────────
-    # pauses_over_2s     : number of gaps >2 s — deliberate thinking breaks
-    # pauses_over_5s     : number of gaps >5 s — longer planning/distraction episodes
-    # mean_long_pause_ms : mean duration of pauses >2 s; longer = deeper pauses
-    pauses_over_2s     = (all_gaps > 2_000).sum()
-    pauses_over_5s     = (all_gaps > 5_000).sum()
-    long_pauses        = all_gaps[all_gaps > 2_000]
-    mean_long_pause_ms = long_pauses.mean() if len(long_pauses) > 0 else 0.0
-
-    # ── REVISION ──────────────────────────────────────────────────────────────
-    # deletion_ratio        : Remove/Cut events ÷ total events — fraction of time spent deleting
-    # global_revision_count : events where cursor is >50 chars behind the furthest point reached;
-    #                         signals jumping back to rewrite a sentence or more
-    # local_revision_count  : events where cursor is ≤10 chars behind frontier — nearby typo fixes
-    frontier              = essay['cursor_position'].cummax()
-    dist_from_frontier    = frontier - essay['cursor_position']
-    deletion_ratio        = (essay['activity'] == 'Remove/Cut').sum() / n
-    global_revision_count = (dist_from_frontier > 50).sum()
-    local_revision_count  = (dist_from_frontier <= 10).sum()
-
-    # ── PUNCTUATION ───────────────────────────────────────────────────────────
-    # Letters are anonymised as 'q' but punctuation in text_change is preserved.
-    # period_count    : number of '.' typed — proxy for sentence count
-    # comma_count     : number of ',' typed — proxy for syntactic complexity
-    # semicolon_count : number of ';' typed — marker of advanced sentence construction
-    # newline_count   : number of '\n' typed — proxy for paragraph count
-    tc              = essay['text_change']
-    period_count    = (tc == '.').sum()
-    comma_count     = (tc == ',').sum()
-    semicolon_count = (tc == ';').sum()
-    newline_count   = (tc == '\n').sum()
-
-    # ── WRITING MOMENTUM ──────────────────────────────────────────────────────
-    # Session split into three equal time-thirds to capture production dynamics.
-    # wpm_early        : words per minute in first third — how fast the writer starts
-    # wpm_middle       : words per minute in middle third — often peak production
-    # wpm_late         : words per minute in final third — generation vs editing trade-off
-    # wpm_acceleration : wpm_middle − wpm_early; positive = writer ramped up speed
-    t_min   = essay['down_time'].min()
-    t_max   = essay['down_time'].max()
-    t_range = max(t_max - t_min, 1)
-    t1, t2  = t_min + t_range / 3, t_min + 2 * t_range / 3
-
-    wpm_early        = wpm_in_window(essay, t_min, t1)
-    wpm_middle       = wpm_in_window(essay, t1,   t2)
-    wpm_late         = wpm_in_window(essay, t2,   t_max)
-    wpm_acceleration = wpm_middle - wpm_early
-
-    rows.append({
-        'id': essay_id,
-        'final_word_count':      final_word_count,
-        'total_events':          total_events,
-        'median_iki_ms':         median_iki_ms,
-        'iki_std':               iki_std,
-        'typing_wpm':            typing_wpm,
-        'pauses_over_2s':        pauses_over_2s,
-        'pauses_over_5s':        pauses_over_5s,
-        'mean_long_pause_ms':    mean_long_pause_ms,
-        'deletion_ratio':        deletion_ratio,
-        'global_revision_count': global_revision_count,
-        'local_revision_count':  local_revision_count,
-        'period_count':          period_count,
-        'comma_count':           comma_count,
-        'semicolon_count':       semicolon_count,
-        'newline_count':         newline_count,
-        'wpm_early':             wpm_early,
-        'wpm_middle':            wpm_middle,
-        'wpm_late':              wpm_late,
-        'wpm_acceleration':      wpm_acceleration,
-    })
-
-df = pd.DataFrame(rows).merge(scores, on='id').fillna(0)
+df = compute_features(logs).merge(scores, on='id').fillna(0)
 print(f"Feature matrix: {df.shape[0]} essays × {df.shape[1] - 2} features")
 
-FEATURE_COLS = [c for c in df.columns if c not in ['id', 'score']]
 X = df[FEATURE_COLS].values
 y = df['score'].values
 
@@ -303,44 +192,14 @@ imp_df = pd.DataFrame({
 print("\nFeature importance (gain, averaged over 5 folds):")
 print(imp_df.to_string(index=False))
 
-# Category colours — same palette as eda.py
-categories = {
-    'final_word_count':      'Volume',
-    'total_events':          'Volume',
-    'median_iki_ms':         'Speed & Fluency',
-    'iki_std':               'Speed & Fluency',
-    'typing_wpm':            'Speed & Fluency',
-    'pauses_over_2s':        'Pausing',
-    'pauses_over_5s':        'Pausing',
-    'mean_long_pause_ms':    'Pausing',
-    'deletion_ratio':        'Revision',
-    'global_revision_count': 'Revision',
-    'local_revision_count':  'Revision',
-    'period_count':          'Punctuation',
-    'comma_count':           'Punctuation',
-    'semicolon_count':       'Punctuation',
-    'newline_count':         'Punctuation',
-    'wpm_early':             'Momentum',
-    'wpm_middle':            'Momentum',
-    'wpm_late':              'Momentum',
-    'wpm_acceleration':      'Momentum',
-}
-cat_palette = {
-    'Volume':          '#4C72B0',
-    'Speed & Fluency': '#DD8452',
-    'Pausing':         '#55A868',
-    'Revision':        '#C44E52',
-    'Punctuation':     '#8172B2',
-    'Momentum':        '#937860',
-}
 from matplotlib.patches import Patch
-legend_elements = [Patch(facecolor=c, label=k) for k, c in cat_palette.items()]
+legend_elements = [Patch(facecolor=c, label=k) for k, c in CAT_PALETTE.items()]
 
 def plot_importance(imp_series, feat_names, title, filename, xlabel):
     order      = imp_series.argsort()
     sorted_f   = feat_names[order]
     sorted_v   = imp_series[order]
-    colors     = [cat_palette[categories[f]] for f in sorted_f]
+    colors     = [CAT_PALETTE[CATEGORIES[f]] for f in sorted_f]
 
     fig, ax = plt.subplots(figsize=(10, 8))
     bars = ax.barh(sorted_f, sorted_v, color=colors, edgecolor='white')
@@ -380,7 +239,7 @@ plot_importance(
 # A feature high in split but low in gain = used often but not very decisive
 fig, ax = plt.subplots(figsize=(9, 7))
 for feat, g, s in zip(FEATURE_COLS, importance_gain, importance_split):
-    color = cat_palette[categories[feat]]
+    color = CAT_PALETTE[CATEGORIES[feat]]
     ax.scatter(s, g, color=color, s=60, zorder=3)
     ax.annotate(feat, (s, g), fontsize=7, xytext=(4, 2), textcoords='offset points')
 ax.set_xlabel('Split Importance (frequency)', fontsize=11)

@@ -18,6 +18,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
+from features import compute_features, CATEGORIES, CAT_PALETTE
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR   = os.path.join(os.path.dirname(__file__), 'data')
@@ -74,127 +75,8 @@ print("\n" + "="*60)
 print("SECTION 2 – PER-ESSAY FEATURE ENGINEERING")
 print("="*60)
 
-# Pre-compute inter-keystroke interval (IKI) — time between consecutive key-downs
-# within each essay (first event of each essay gets NaN)
-logs['iki'] = logs.groupby('id')['down_time'].diff()
-
-rows = []
 print("Computing per-essay features...")
-
-def wpm_in_window(essay, t_start, t_end):
-    """Words per minute added in the time window [t_start, t_end] (ms)."""
-    mask    = (essay['down_time'] >= t_start) & (essay['down_time'] <= t_end)
-    segment = essay[mask]
-    if len(segment) == 0:
-        return 0.0
-    wc_start = essay.loc[essay['down_time'] < t_start, 'word_count'].max()
-    wc_start = wc_start if pd.notna(wc_start) else 0
-    words    = max(segment['word_count'].max() - wc_start, 0)
-    minutes  = (t_end - t_start) / 60_000
-    return (words / minutes) if minutes > 0 else 0.0
-
-
-for essay_id, essay in logs.groupby('id'):
-    essay = essay.reset_index(drop=True)
-    n     = len(essay)
-    gaps  = essay.loc[essay['activity'] == 'Input', 'iki'].dropna()
-    all_gaps = essay['iki'].dropna()
-
-    # ── VOLUME ────────────────────────────────────────────────────────────────
-    # final_word_count : max word_count in session — length of finished essay
-    # total_events     : total log rows — overall amount of writing activity
-    final_word_count = essay['word_count'].max()
-    total_events     = n
-
-    # ── SPEED & FLUENCY ───────────────────────────────────────────────────────
-    # median_iki_ms : median gap (ms) between Input keystrokes; lower = more fluent
-    # iki_std       : std of IKI; higher = more uneven, hesitant rhythm
-    # typing_wpm    : words per active minute (session time minus pauses >2 s)
-    median_iki_ms = gaps.median() if len(gaps) > 0 else np.nan
-    iki_std       = gaps.std()    if len(gaps) > 0 else np.nan
-
-    total_time_ms   = essay['down_time'].max() - essay['down_time'].min()
-    active_time_ms  = max(total_time_ms - all_gaps[all_gaps > 2_000].sum(), 1)
-    typing_wpm      = final_word_count / (active_time_ms / 60_000)
-
-    # ── PAUSING ───────────────────────────────────────────────────────────────
-    # pauses_over_2s     : number of gaps >2 s — deliberate thinking breaks
-    # pauses_over_5s     : number of gaps >5 s — longer planning/distraction episodes
-    # mean_long_pause_ms : mean duration of pauses >2 s; longer = deeper pauses
-    pauses_over_2s     = (all_gaps > 2_000).sum()
-    pauses_over_5s     = (all_gaps > 5_000).sum()
-    long_pauses        = all_gaps[all_gaps > 2_000]
-    mean_long_pause_ms = long_pauses.mean() if len(long_pauses) > 0 else 0.0
-
-    # ── REVISION ──────────────────────────────────────────────────────────────
-    # deletion_ratio        : Remove/Cut events ÷ total events — fraction of time spent deleting
-    # global_revision_count : events where cursor is >50 chars behind the furthest point reached;
-    #                         signals jumping back to rewrite a sentence or more
-    # local_revision_count  : events where cursor is ≤10 chars behind frontier — nearby typo fixes
-    frontier              = essay['cursor_position'].cummax()
-    dist_from_frontier    = frontier - essay['cursor_position']
-    deletion_ratio        = (essay['activity'] == 'Remove/Cut').sum() / n
-    global_revision_count = (dist_from_frontier > 50).sum()
-    local_revision_count  = (dist_from_frontier <= 10).sum()
-
-    # ── PUNCTUATION ───────────────────────────────────────────────────────────
-    # Letters are anonymised as 'q' but punctuation in text_change is preserved.
-    # period_count    : number of '.' typed — proxy for sentence count
-    # comma_count     : number of ',' typed — proxy for syntactic complexity
-    # semicolon_count : number of ';' typed — marker of advanced sentence construction
-    # newline_count   : number of '\n' typed — proxy for paragraph count
-    tc              = essay['text_change']
-    period_count    = (tc == '.').sum()
-    comma_count     = (tc == ',').sum()
-    semicolon_count = (tc == ';').sum()
-    newline_count   = (tc == '\n').sum()
-
-    # ── WRITING MOMENTUM ──────────────────────────────────────────────────────
-    # Session split into three equal time-thirds to capture production dynamics.
-    # wpm_early        : words per minute in first third — how fast the writer starts
-    # wpm_middle       : words per minute in middle third — often peak production
-    # wpm_late         : words per minute in final third — generation vs editing trade-off
-    # wpm_acceleration : wpm_middle − wpm_early; positive = writer ramped up speed
-    t_min   = essay['down_time'].min()
-    t_max   = essay['down_time'].max()
-    t_range = max(t_max - t_min, 1)
-    t1, t2  = t_min + t_range / 3, t_min + 2 * t_range / 3
-
-    wpm_early        = wpm_in_window(essay, t_min, t1)
-    wpm_middle       = wpm_in_window(essay, t1,   t2)
-    wpm_late         = wpm_in_window(essay, t2,   t_max)
-    wpm_acceleration = wpm_middle - wpm_early
-
-    rows.append({
-        'id': essay_id,
-        # Volume
-        'final_word_count':      final_word_count,
-        'total_events':          total_events,
-        # Speed & fluency
-        'median_iki_ms':         median_iki_ms,
-        'iki_std':               iki_std,
-        'typing_wpm':            typing_wpm,
-        # Pausing
-        'pauses_over_2s':        pauses_over_2s,
-        'pauses_over_5s':        pauses_over_5s,
-        'mean_long_pause_ms':    mean_long_pause_ms,
-        # Revision
-        'deletion_ratio':        deletion_ratio,
-        'global_revision_count': global_revision_count,
-        'local_revision_count':  local_revision_count,
-        # Punctuation
-        'period_count':          period_count,
-        'comma_count':           comma_count,
-        'semicolon_count':       semicolon_count,
-        'newline_count':         newline_count,
-        # Writing momentum
-        'wpm_early':             wpm_early,
-        'wpm_middle':            wpm_middle,
-        'wpm_late':              wpm_late,
-        'wpm_acceleration':      wpm_acceleration,
-    })
-
-features = pd.DataFrame(rows).merge(scores, on='id')
+features = compute_features(logs).merge(scores, on='id')
 print(f"Feature matrix: {features.shape[0]} essays × {features.shape[1] - 2} features")
 
 # =============================================================================
@@ -221,40 +103,9 @@ corr = (features[feat_cols + ['score']]
 print("\nAll feature correlations with score (ranked):")
 print(corr.to_string())
 
-# Category labels for colour-coding the bar chart
-categories = {
-    'final_word_count':      'Volume',
-    'total_events':          'Volume',
-    'median_iki_ms':         'Speed & Fluency',
-    'iki_std':               'Speed & Fluency',
-    'typing_wpm':            'Speed & Fluency',
-    'pauses_over_2s':        'Pausing',
-    'pauses_over_5s':        'Pausing',
-    'mean_long_pause_ms':    'Pausing',
-    'deletion_ratio':        'Revision',
-    'global_revision_count': 'Revision',
-    'local_revision_count':  'Revision',
-    'period_count':          'Punctuation',
-    'comma_count':           'Punctuation',
-    'semicolon_count':       'Punctuation',
-    'newline_count':         'Punctuation',
-    'wpm_early':             'Momentum',
-    'wpm_middle':            'Momentum',
-    'wpm_late':              'Momentum',
-    'wpm_acceleration':      'Momentum',
-}
-cat_palette = {
-    'Volume':          '#4C72B0',
-    'Speed & Fluency': '#DD8452',
-    'Pausing':         '#55A868',
-    'Revision':        '#C44E52',
-    'Punctuation':     '#8172B2',
-    'Momentum':        '#937860',
-}
-
 # Plot 2 – Ranked bar chart coloured by category
 corr_sorted = corr.sort_values(ascending=True)   # ascending so highest is at top
-bar_colors  = [cat_palette[categories[f]] for f in corr_sorted.index]
+bar_colors  = [CAT_PALETTE[CATEGORIES[f]] for f in corr_sorted.index]
 
 fig, ax = plt.subplots(figsize=(10, 9))
 bars = ax.barh(corr_sorted.index, corr_sorted.values, color=bar_colors, edgecolor='white')
@@ -267,7 +118,7 @@ for bar, v in zip(bars, corr_sorted.values):
             f'{v:.3f}', va='center', ha='left' if v >= 0 else 'right', fontsize=8)
 # Legend
 from matplotlib.patches import Patch
-legend_elements = [Patch(facecolor=c, label=k) for k, c in cat_palette.items()]
+legend_elements = [Patch(facecolor=c, label=k) for k, c in CAT_PALETTE.items()]
 ax.legend(handles=legend_elements, loc='lower right', fontsize=9, title='Category')
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, '02_feature_correlation_signed.png'), dpi=150)
@@ -278,7 +129,7 @@ print("\n[Saved] 02_feature_correlation_signed.png")
 # Use abs(r) when ranking importance because a feature with r = -0.57 is equally
 # informative as one with r = +0.57 — the sign tells direction, not usefulness.
 abs_corr        = corr.abs().sort_values(ascending=True)   # ascending so strongest is at top
-abs_bar_colors  = [cat_palette[categories[f]] for f in abs_corr.index]
+abs_bar_colors  = [CAT_PALETTE[CATEGORIES[f]] for f in abs_corr.index]
 
 fig, ax = plt.subplots(figsize=(10, 9))
 bars = ax.barh(abs_corr.index, abs_corr.values, color=abs_bar_colors, edgecolor='white')
@@ -305,14 +156,14 @@ axes = axes.flatten()
 for ax, feat in zip(axes, top_features):
     x = features[feat]
     y = features['score']
-    ax.scatter(x, y, alpha=0.2, s=8, color=cat_palette[categories[feat]])
+    ax.scatter(x, y, alpha=0.2, s=8, color=CAT_PALETTE[CATEGORIES[feat]])
     m, b = np.polyfit(x.fillna(x.median()), y, 1)
     xs = np.linspace(x.min(), x.max(), 200)
     ax.plot(xs, m * xs + b, color='red', linewidth=1.5)
     r = corr[feat]
     ax.set_xlabel(feat, fontsize=9)
     ax.set_ylabel('Score')
-    ax.set_title(f'{feat}\nr = {r:.3f}  |  [{categories[feat]}]', fontsize=9)
+    ax.set_title(f'{feat}\nr = {r:.3f}  |  [{CATEGORIES[feat]}]', fontsize=9)
 plt.suptitle('Top 6 Features vs Essay Score', fontsize=12, fontweight='bold')
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, '03_scatter_top6_features.png'), dpi=150)
@@ -333,9 +184,9 @@ fig, axes = plt.subplots(2, 3, figsize=(16, 10))
 axes = axes.flatten()
 for ax, feat in zip(axes, plot_feats):
     features.boxplot(column=feat, by='score_bucket', ax=ax)
-    ax.set_title(f'{feat}\n[{categories[feat]}]', fontsize=9)
+    ax.set_title(f'{feat}\n[{CATEGORIES[feat]}]', fontsize=9)
     ax.set_xlabel('Score Bucket'); ax.set_ylabel(feat)
-    plt.sca(ax); plt.title(f'{feat}  [{categories[feat]}]', fontsize=9)
+    plt.sca(ax); plt.title(f'{feat}  [{CATEGORIES[feat]}]', fontsize=9)
 plt.suptitle('Feature Distributions by Score Bucket', fontsize=12, fontweight='bold')
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, '04_boxplots_by_score_bucket.png'), dpi=150)
