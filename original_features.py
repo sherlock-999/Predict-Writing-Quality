@@ -122,7 +122,7 @@ def compute_features(logs):
         dist_from_frontier    = frontier - essay['cursor_position']
         deletion_ratio        = (essay['activity'] == 'Remove/Cut').sum() / n
         global_revision_count = (dist_from_frontier > 50).sum()
-        local_revision_count  = (dist_from_frontier <= 10).sum()
+        local_revision_count  = ((dist_from_frontier > 0) & (dist_from_frontier <= 10)).sum()
 
         # ── PUNCTUATION ────────────────────────────────────────────────────────
         tc              = essay['text_change']
