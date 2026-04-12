@@ -1,3 +1,5 @@
+.vscode/
+
 # Data — too large for version control
 data/
 
@@ -7,6 +9,7 @@ models/
 # Generated outputs
 eda_plots/
 lgbm_plots/
+xgb_plots/
 submission.csv
 
 # Python
