@@ -20,7 +20,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_squared_error
-from important_features import compute_features, FEATURE_COLS, CATEGORIES, CAT_PALETTE
+from testing_features import compute_features, FEATURE_COLS, CATEGORIES, CAT_PALETTE
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR   = os.path.join(os.path.dirname(__file__), 'data')
