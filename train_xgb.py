@@ -2,16 +2,24 @@
 XGBoost Regression: Predicting Essay Score from Writing Process Features
 ========================================================================
 Pipeline:
-  1. Feature engineering  — same 120 features as train_lgbm.py
-  2. 5-fold stratified CV  — stratify on score bins so every fold is representative
+  1. Feature engineering  — testing_new_features (loads CSV cache if available)
+  2. 5-seed × 10-fold stratified CV  — 50 models total for stable OOF
   3. XGBoost regression    — optimised with early stopping per fold
-  4. Evaluation            — CV RMSE + per-fold scores
+  4. Evaluation            — CV RMSE + per-fold scores, OOF averaged across seeds
   5. Feature importance    — gain-based and weight-based plots
 
-Output plots: writing_process/xgb_plots/
+Output:
+  models/xgb_s{seed}_fold{fold}.json  — 50 trained models
+  xgb_plots/01_oof_predictions.png
+  xgb_plots/02_importance_gain.png
+  xgb_plots/03_importance_weight.png
+
+Usage:
+    conda run -n exp python train_xgb.py
 """
 
 import os
+import pickle
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -21,25 +29,41 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_squared_error
-from important_features import compute_features, FEATURE_COLS, CATEGORIES, CAT_PALETTE
+from v4_features import compute_features, FEATURE_COLS, CATEGORIES, CAT_PALETTE
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_DIR   = os.path.join(os.path.dirname(__file__), 'data')
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'xgb_plots')
-MODELS_DIR = os.path.join(os.path.dirname(__file__), 'models')
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+BASE_DIR   = os.path.dirname(__file__)
+DATA_DIR   = os.path.join(BASE_DIR, 'data')
+MODELS_DIR  = os.path.join(BASE_DIR, 'xgb_model')
+PLOT_DIR    = os.path.join(BASE_DIR, 'xgb_plots')
+TFIDF_PATH  = os.path.join(MODELS_DIR, 'tfidf', 'tfidf_svd.pkl')
 os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+# ── CV config ─────────────────────────────────────────────────────────────────
+N_FOLDS = 10
+SEEDS   = [42, 21, 2022, 7, 4]   # diverse seeds for better ensemble
 
 # =============================================================================
-# SECTION 1 – FEATURE ENGINEERING
+# SECTION 1 – LOAD DATA
 # =============================================================================
-print("Loading data...")
-logs   = pd.read_csv(os.path.join(DATA_DIR, 'train_logs.csv'))
-scores = pd.read_csv(os.path.join(DATA_DIR, 'train_scores.csv'))
+features_cache = os.path.join(DATA_DIR, 'train_features_v4.csv')
 
-print("Computing per-essay features...")
-df = compute_features(logs).merge(scores, on='id').fillna(0)
-print(f"Feature matrix: {df.shape[0]} essays × {df.shape[1] - 2} features")
+if os.path.exists(features_cache):
+    print(f"\nLoading precomputed features from {features_cache}...")
+    df = pd.read_csv(features_cache).fillna(0)
+else:
+    print("\nCache not found — computing features from raw logs...")
+    print("  (run precompute_features.py first to speed this up)")
+    logs   = pd.read_csv(os.path.join(DATA_DIR, 'train_logs.csv'))
+    scores = pd.read_csv(os.path.join(DATA_DIR, 'train_scores.csv'))
+    feat_df, tfidf_pipeline = compute_features(logs)
+    df = feat_df.merge(scores, on='id').fillna(0)
+    with open(TFIDF_PATH, 'wb') as f:
+        pickle.dump(tfidf_pipeline, f)
+    print(f"  Saved TF-IDF SVD pipeline → {TFIDF_PATH}")
+
+print(f"  {df.shape[0]} essays × {len(FEATURE_COLS)} features")
 
 X = df[FEATURE_COLS].values
 y = df['score'].values
@@ -61,87 +85,97 @@ y = df['score'].values
 # - n_estimators=2000            : upper bound; early stopping finds true optimum
 # - early_stopping_rounds=50     : stop if val RMSE hasn't improved for 50 rounds
 XGB_PARAMS = {
-    'objective':         'reg:squarederror',
-    'eval_metric':       'rmse',
-    'max_depth':          6,
-    'min_child_weight':   5,
-    'learning_rate':      0.05,
-    'subsample':          0.8,
-    'colsample_bytree':   0.8,
-    'reg_alpha':          0.1,
-    'reg_lambda':         1.0,
-    'n_estimators':       2000,
-    'verbosity':          0,
-    'random_state':       42,
-    'device':             'cpu',
+    'learning_rate': 0.005,
+    'objective' : 'reg:squarederror',
+    'reg_alpha': 0.0008774661176012108,
+    'reg_lambda': 2.542812743920178,
+    'colsample_bynode': 0.7839026197349153,
+    'subsample': 0.8994226268096415, 
+    'eta': 0.04730766698056879, 
+    'tree_method': "gpu_hist",
+    'n_estimators': 2000,
+    'random_state': 42,
+    'eval_metric': 'rmse',
+    'device':             'cuda',
     'early_stopping_rounds': 50,
 }
 
 # =============================================================================
-# SECTION 3 – 5-FOLD STRATIFIED CROSS-VALIDATION
+# SECTION 3 – REPEATED STRATIFIED K-FOLD CV
 # =============================================================================
-# Stratify on score bins so every fold has a representative mix of high/low scorers.
-print("\n" + "="*60)
-print("SECTION 3 – 5-FOLD STRATIFIED CV")
-print("="*60)
+print(f"\n{'='*60}")
+print(f"SECTION 3 – {len(SEEDS)}-SEED × {N_FOLDS}-FOLD CV  ({len(SEEDS) * N_FOLDS} models total)")
+print(f"{'='*60}")
 
-score_bins = pd.cut(y, bins=5, labels=False)
-skf        = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+# Accumulate OOF predictions across seeds then average for final RMSE.
+all_oof_preds = np.zeros((len(SEEDS), len(y)))
 
-oof_preds   = np.zeros(len(y))
-fold_rmses  = []
-fold_models = []
-
-# Accumulate feature importances (gain and weight) across folds
+# Accumulate feature importances across all models.
 importance_gain   = np.zeros(len(FEATURE_COLS))
 importance_weight = np.zeros(len(FEATURE_COLS))
 
-for fold, (train_idx, val_idx) in enumerate(skf.split(X, score_bins), start=1):
-    X_train, X_val = X[train_idx], X[val_idx]
-    y_train, y_val = y[train_idx], y[val_idx]
+n_models_saved = 0
 
-    model = xgb.XGBRegressor(**XGB_PARAMS)
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
-    )
+for seed_idx, seed in enumerate(SEEDS):
+    print(f"\n── Seed {seed} (seed {seed_idx + 1}/{len(SEEDS)}) ──")
 
-    val_preds          = model.predict(X_val)
-    oof_preds[val_idx] = val_preds
-    fold_rmse          = mean_squared_error(y_val, val_preds) ** 0.5
-    fold_rmses.append(fold_rmse)
-    fold_models.append(model)
+    skf       = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=seed)
+    oof_preds = np.zeros(len(y))
 
-    # XGBoost importance scores keyed by feature name — align to FEATURE_COLS order
-    booster = model.get_booster()
-    gain_map   = booster.get_score(importance_type='gain')
-    weight_map = booster.get_score(importance_type='weight')
-    for i, feat in enumerate(FEATURE_COLS):
-        importance_gain[i]   += gain_map.get(f'f{i}', 0.0)
-        importance_weight[i] += weight_map.get(f'f{i}', 0.0)
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y.astype(str)), start=1):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
 
-    best_iter = model.best_iteration
-    print(f"  Fold {fold} | best iter: {best_iter:4d} | val RMSE: {fold_rmse:.4f}")
+        params = {**XGB_PARAMS, 'random_state': seed}
 
-# OOF RMSE — primary performance metric
-oof_rmse      = mean_squared_error(y, oof_preds) ** 0.5
-baseline_rmse = mean_squared_error(y, np.full_like(y, y.mean())) ** 0.5
+        model = xgb.XGBRegressor(**params)
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
 
-print(f"\n  CV RMSE  (mean ± std): {np.mean(fold_rmses):.4f} ± {np.std(fold_rmses):.4f}")
-print(f"  OOF RMSE (all folds) : {oof_rmse:.4f}")
-print(f"  Baseline RMSE (mean) : {baseline_rmse:.4f}  ← predicting mean score for everyone")
-print(f"  Improvement over baseline: {baseline_rmse - oof_rmse:.4f}")
+        val_preds          = model.predict(X_val)
+        oof_preds[val_idx] = val_preds
+        fold_rmse          = mean_squared_error(y_val, val_preds) ** 0.5
 
-# Save each fold model in XGBoost's native JSON format
-for fold_idx, model in enumerate(fold_models, start=1):
-    path = os.path.join(MODELS_DIR, f'xgb_fold{fold_idx}.json')
-    model.get_booster().save_model(path)
-print(f"\n  Saved {len(fold_models)} fold models to: {MODELS_DIR}/")
+        # XGBoost importance scores keyed by feature index — align to FEATURE_COLS order
+        booster    = model.get_booster()
+        gain_map   = booster.get_score(importance_type='gain')
+        weight_map = booster.get_score(importance_type='weight')
+        for i in range(len(FEATURE_COLS)):
+            importance_gain[i]   += gain_map.get(f'f{i}', 0.0)
+            importance_weight[i] += weight_map.get(f'f{i}', 0.0)
 
-# Average importances across folds for a stable estimate
-importance_gain   /= 5
-importance_weight /= 5
+        # Save model — predict_xgb.py globs xgb_s*_fold*.json
+        model_path = os.path.join(MODELS_DIR, f'xgb_s{seed}_fold{fold}.json')
+        model.get_booster().save_model(model_path)
+        n_models_saved += 1
+
+        print(f"  Fold {fold:2d} | best iter: {model.best_iteration:4d} | val RMSE: {fold_rmse:.4f}")
+
+    seed_oof_rmse = mean_squared_error(y, oof_preds) ** 0.5
+    all_oof_preds[seed_idx] = oof_preds
+    print(f"  → Seed {seed} OOF RMSE: {seed_oof_rmse:.4f}")
+
+# =============================================================================
+# SECTION 3b – EVALUATION
+# =============================================================================
+mean_oof_preds = all_oof_preds.mean(axis=0)
+oof_rmse       = mean_squared_error(y, mean_oof_preds) ** 0.5
+baseline_rmse  = mean_squared_error(y, np.full_like(y, y.mean())) ** 0.5
+
+seed_rmses = [mean_squared_error(y, all_oof_preds[i]) ** 0.5 for i in range(len(SEEDS))]
+print(f"\n  Per-seed OOF RMSE : {[f'{r:.4f}' for r in seed_rmses]}")
+print(f"  Mean ± Std        : {np.mean(seed_rmses):.4f} ± {np.std(seed_rmses):.4f}")
+print(f"  Ensemble OOF RMSE : {oof_rmse:.4f}  (avg of {len(SEEDS)} seed predictions)")
+print(f"  Baseline RMSE     : {baseline_rmse:.4f}  (predicting mean score)")
+print(f"  Improvement       : {baseline_rmse - oof_rmse:.4f}")
+print(f"\n  Saved {n_models_saved} models to: {MODELS_DIR}/")
+
+# Average importances across all models for a stable estimate
+importance_gain   /= (len(SEEDS) * N_FOLDS)
+importance_weight /= (len(SEEDS) * N_FOLDS)
 
 # =============================================================================
 # SECTION 4 – OOF PREDICTION ANALYSIS
@@ -150,7 +184,7 @@ print("\n" + "="*60)
 print("SECTION 4 – OOF PREDICTION ANALYSIS")
 print("="*60)
 
-oof_df = pd.DataFrame({'true': y, 'pred': oof_preds})
+oof_df = pd.DataFrame({'true': y, 'pred': mean_oof_preds})
 oof_df['error'] = oof_df['pred'] - oof_df['true']
 print(oof_df['error'].describe().round(4))
 
@@ -159,7 +193,8 @@ fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 axes[0].scatter(oof_df['true'], oof_df['pred'], alpha=0.25, s=12, color='darkorange')
 axes[0].plot([0.5, 6], [0.5, 6], 'r--', linewidth=1.2, label='Perfect prediction')
 axes[0].set_xlabel('True Score'); axes[0].set_ylabel('Predicted Score')
-axes[0].set_title(f'OOF: True vs Predicted\nRMSE = {oof_rmse:.4f}')
+axes[0].set_title(f'OOF: True vs Predicted\nEnsemble RMSE = {oof_rmse:.4f}  '
+                  f'({len(SEEDS)} seeds × {N_FOLDS} folds)')
 axes[0].legend()
 
 axes[1].hist(oof_df['error'], bins=40, color='darkorange', edgecolor='white')
@@ -170,7 +205,7 @@ axes[1].set_title('OOF Residual Distribution')
 
 plt.suptitle('Out-of-Fold Predictions — XGBoost', fontweight='bold')
 plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, '01_oof_predictions.png'), dpi=150)
+plt.savefig(os.path.join(PLOT_DIR, '01_oof_predictions.png'), dpi=150)
 plt.close()
 print("\n[Saved] 01_oof_predictions.png")
 
@@ -191,7 +226,7 @@ imp_df = pd.DataFrame({
     'weight':  importance_weight,
 }).sort_values('gain', ascending=False)
 
-print("\nFeature importance (gain, averaged over 5 folds):")
+print(f"\nFeature importance (gain, averaged over {len(SEEDS) * N_FOLDS} models):")
 print(imp_df.to_string(index=False))
 
 legend_elements = [Patch(facecolor=c, label=k) for k, c in CAT_PALETTE.items()]
@@ -214,14 +249,14 @@ def plot_importance(imp_series, feat_names, title, filename, xlabel):
                     f'{v / total * 100:.1f}%', va='center', ha='left', fontsize=8)
     ax.legend(handles=legend_elements, loc='lower right', fontsize=9, title='Category')
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=150)
+    plt.savefig(os.path.join(PLOT_DIR, filename), dpi=150)
     plt.close()
     print(f"[Saved] {filename}")
 
 # Plot 2 – Gain importance
 plot_importance(
     importance_gain, feat_arr,
-    title    = 'Feature Importance: Gain (avg loss reduction per split)\nAveraged over 5 CV folds — XGBoost',
+    title    = f'Feature Importance: Gain (avg over {len(SEEDS) * N_FOLDS} models) — XGBoost',
     filename = '02_importance_gain.png',
     xlabel   = 'Average Gain',
 )
@@ -229,7 +264,7 @@ plot_importance(
 # Plot 3 – Weight importance
 plot_importance(
     importance_weight, feat_arr,
-    title    = 'Feature Importance: Weight (split frequency)\nAveraged over 5 CV folds — XGBoost',
+    title    = f'Feature Importance: Weight (split frequency, avg over {len(SEEDS) * N_FOLDS} models) — XGBoost',
     filename = '03_importance_weight.png',
     xlabel   = 'Average Weight (split count)',
 )
@@ -246,9 +281,9 @@ ax.set_title('Gain vs Weight Importance\n(discrepancies reveal feature behaviour
              fontsize=11, fontweight='bold')
 ax.legend(handles=legend_elements, fontsize=9, title='Category')
 plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, '04_gain_vs_weight.png'), dpi=150)
+plt.savefig(os.path.join(PLOT_DIR, '04_gain_vs_weight.png'), dpi=150)
 plt.close()
 print("[Saved] 04_gain_vs_weight.png")
 
-print(f"\nAll plots saved to: {OUTPUT_DIR}/")
+print(f"\nAll plots saved to: {PLOT_DIR}/")
 print("Done.")

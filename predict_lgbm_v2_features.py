@@ -1,8 +1,10 @@
 """
-Inference: Predict Essay Scores — Kaggle Submission
-=====================================================
+Inference: Predict Essay Scores — Kaggle Submission (LightGBM, Testing Features)
+==================================================================================
 Self-contained script: all feature engineering logic is inlined.
 No local module imports required.
+
+Feature set: testing_features (per-word normalised counts + session_duration_sec)
 
 Paths (Kaggle notebook environment):
     DATA_DIR   = /kaggle/input/competitions/linking-writing-processes-to-writing-quality
@@ -24,7 +26,7 @@ OUTPUT_PATH = 'submission.csv'
 
 
 # =============================================================================
-# FEATURE COLUMNS  (120 features with LightGBM gain >= 15)
+# FEATURE COLUMNS  (testing_features — per-word normalised counts)
 # =============================================================================
 
 FEATURE_COLS = [
@@ -42,14 +44,12 @@ FEATURE_COLS = [
     'input_word_length_max',      # longest word typed during the session
     'input_word_length_std',      # std of typed word lengths — vocabulary variety
     'input_word_length_skew',     # skew of typed word lengths — long-tail word usage
-    'word_count_max',             # max running word count = final essay length
     'word_count_std',             # std of running word count — pace of word accumulation
     'word_count_median',          # median running word count over the session
     'word_count_q1',              # 25th pct word count — how much was written early on
     'word_count_q3',              # 75th pct word count — word count near end of session
 
     # ── 2. SENTENCE CHARACTERISTICS ───────────────────────────────────────────
-    'sent_len_sum',               # total chars across all sentences ≈ essay char length
     'sent_len_mean',              # mean sentence length — verbose vs. concise style
     'sent_len_median',            # median sentence length — robust to outlier sentences
     'sent_len_min',               # shortest sentence — detects fragments
@@ -58,7 +58,7 @@ FEATURE_COLS = [
     'sent_len_last',              # length of the closing sentence
     'sent_len_q1',                # 25th pct sentence length
     'sent_len_q3',                # 75th pct sentence length
-    'sent_count',                 # number of sentences in the essay
+    'sent_per_word',              # number of sentences per word
     'sent_word_count_mean',       # mean words per sentence — syntactic density
     'sent_word_count_max',        # longest sentence by word count
     'sent_word_count_first',      # words in the first sentence
@@ -68,7 +68,6 @@ FEATURE_COLS = [
     'sent_word_count_q3',         # 75th pct words per sentence
 
     # ── 3. PARAGRAPH CHARACTERISTICS ──────────────────────────────────────────
-    'paragraph_len_sum',          # total chars across all paragraphs ≈ essay length
     'paragraph_len_mean',         # mean paragraph length — how developed each idea is
     'paragraph_len_median',       # median paragraph length — robust central tendency
     'paragraph_len_min',          # shortest paragraph — thin or transitional paragraphs
@@ -86,21 +85,19 @@ FEATURE_COLS = [
     'paragraph_word_count_q1',    # 25th pct paragraph word count
     'paragraph_word_count_median',# median paragraph word count
     'paragraph_word_count_q3',    # 75th pct paragraph word count
-    'paragraph_word_count_sum',   # total words across all paragraphs ≈ word_count_max
 
     # ── 4. PUNCTUATION & FORMATTING ───────────────────────────────────────────
-    'down_event_comma_cnt',       # comma key presses — syntactic complexity (clauses, lists)
-    'text_change_comma_cnt',      # literal ',' inserted — confirms comma usage
-    'up_event_comma_cnt',         # comma key releases — secondary comma signal
-    'down_event_period_cnt',      # period key presses — sentence count proxy
-    'text_change_period_cnt',     # literal '.' inserted — sentence ending count
-    'down_event_Enter_cnt',       # enter presses — paragraph/line break creation
-    'text_change_newline_cnt',    # '\n' inserted — paragraph boundary count
-    'down_event_Shift_cnt',       # shift presses — capitalisation and punctuation (?,!,:)
-    'down_event_CapsLock_cnt',    # caps-lock usage — stylistic or error signal
-    'text_change_dash_cnt',       # '-' inserted — compound words, em-dashes, hyphens
-    'text_change_question_cnt',   # '?' inserted — interrogative sentence usage
-    'text_change_quote_cnt',      # "'" inserted — apostrophes and quotation marks
+    'comma_per_word',             # comma key presses per word
+    'comma_text_per_word',        # literal ',' inserted per word
+    'period_per_word',            # period key presses per word
+    'period_text_per_word',       # literal '.' inserted per word
+    'enter_per_word',             # enter presses per word
+    'newline_per_word',           # '\n' inserted per word
+    'shift_per_word',             # shift presses per word
+    'capslock_per_word',          # caps-lock usage per word
+    'dash_per_word',              # '-' inserted per word
+    'question_per_word',          # '?' inserted per word
+    'quote_per_word',             # "'" inserted per word
 
     # ── 5. TYPING SPEED & FLUENCY ─────────────────────────────────────────────
     'keys_per_second',            # gross keystrokes per second — overall typing speed
@@ -111,14 +108,12 @@ FEATURE_COLS = [
     'action_time_max',            # longest single key hold (e.g. held backspace to delete)
     'action_time_q1',             # 25th pct hold duration
     'action_time_q3',             # 75th pct hold duration
-    'down_event_q_cnt',           # total letter keystrokes — raw character input volume
-    'text_change_q_cnt',          # anonymised letter insertions — net typing volume
-    'up_event_q_cnt',             # letter key releases — mirrors down_event_q_cnt
-    'down_event_Space_cnt',       # space presses — word boundary count
-    'text_change_space_cnt',      # spaces inserted — net word count signal
+    'q_keys_per_word',            # letter keystrokes per word
+    'q_text_per_word',            # anonymised letter insertions per word
+    'space_per_word',             # space presses per word
+    'space_text_per_word',        # spaces inserted per word
     'n_unique_text_change',       # distinct text changes — typing content variety
     'n_unique_down_event',        # distinct keys used — keyboard range
-    'n_unique_up_event',          # distinct key releases used
 
     # ── 6. PAUSING BEHAVIOR ───────────────────────────────────────────────────
     'idle_largest_latency',       # single longest idle gap — biggest pause taken
@@ -126,15 +121,15 @@ FEATURE_COLS = [
     'idle_mean',                  # mean idle gap — overall session pacing
     'idle_std',                   # std of idle gaps — consistency of typing rhythm
     'idle_total',                 # total time spent idle — time not actively typing
-    'pauses_half_sec',            # pauses > 0.5 s — micro hesitations between words
-    'pauses_1_sec',               # pauses > 1 s — brief thinking breaks
-    'pauses_1_half_sec',          # pauses > 1.5 s
-    'pauses_2_sec',               # pauses > 2 s — deliberate planning or reading breaks
-    'pauses_3_sec',               # pauses > 3 s — longer cognitive processing episodes
+    'pauses_half_per_word',       # pauses > 0.5 s per word
+    'pauses_1_per_word',          # pauses > 1 s per word
+    'pauses_1half_per_word',      # pauses > 1.5 s per word
+    'pauses_2_per_word',          # pauses > 2 s per word
+    'pauses_3_per_word',          # pauses > 3 s per word
 
     # ── 7. REVISION BEHAVIOR ──────────────────────────────────────────────────
-    'activity_RemoveCut_cnt',     # total Remove/Cut events — absolute revision volume
-    'down_event_Backspace_cnt',   # backspace presses — local character-level corrections
+    'removecut_per_word',         # Remove/Cut events per word
+    'backspace_per_word',         # backspace presses per word
     'r_burst_mean',               # mean revision burst length — typical deletion run size
     'r_burst_std',                # std of revision burst lengths — consistency of deletions
     'r_burst_median',             # median revision burst length
@@ -142,9 +137,9 @@ FEATURE_COLS = [
     'r_burst_first',              # first revision burst — how soon writer started correcting
 
     # ── 8. PRODUCTION FLOW & NAVIGATION ──────────────────────────────────────
-    'activity_Input_cnt',         # total input events — overall typing engagement
-    'activity_Nonproduction_cnt', # navigation/thinking events not producing text
-    'p_burst_count',              # number of production bursts — how many flow episodes
+    'input_per_word',             # input events per word
+    'nonproduction_per_word',     # navigation/thinking events per word
+    'p_burst_per_word',           # production bursts per word
     'p_burst_mean',               # mean burst length — typical flow episode size
     'p_burst_std',                # std of burst lengths — consistency of flow
     'p_burst_median',             # median burst length
@@ -152,15 +147,15 @@ FEATURE_COLS = [
     'p_burst_first',              # first burst length — how fast writer entered flow
     'p_burst_last',               # last burst length — late-session production effort
     'product_to_keys',            # net chars produced ÷ total keys pressed — efficiency
-    'cursor_position_max',        # furthest cursor position ≈ essay character length
+    'session_duration_sec',       # total session duration in seconds
     'cursor_position_mean',       # mean cursor position — average depth into essay
     'cursor_position_std',        # std of cursor position — how much cursor moved around
     'cursor_position_median',     # median cursor position
     'cursor_position_q1',         # 25th pct cursor position
     'cursor_position_q3',         # 75th pct cursor position
-    'down_event_Leftclick_cnt',   # mouse clicks — jumping to a new position in text
-    'down_event_ArrowLeft_cnt',   # left-arrow presses — backward character navigation
-    'down_event_ArrowRight_cnt',  # right-arrow presses — forward character navigation
+    'leftclick_per_word',         # mouse clicks per word
+    'arrowleft_per_word',         # left-arrow presses per word
+    'arrowright_per_word',        # right-arrow presses per word
     'down_time_min',              # timestamp of first keypress — session start offset
     'down_time_mean',             # mean keypress timestamp — session pacing centroid
     'down_time_std',              # std of keypress timestamps — spread of activity
@@ -183,7 +178,6 @@ def _count_features(essay: pd.DataFrame) -> dict:
     act = essay['activity']
     tc  = essay['text_change']
     de  = essay['down_event']
-    ue  = essay['up_event']
 
     feats = {}
 
@@ -221,16 +215,8 @@ def _count_features(essay: pd.DataFrame) -> dict:
     ]:
         feats[key] = int((de == value).sum())
 
-    for value, key in [
-        ('q',    'up_event_q_cnt'),
-        (',',    'up_event_comma_cnt'),
-        ('Shift','up_event_Shift_cnt'),
-    ]:
-        feats[key] = int((ue == value).sum())
-
     feats['n_unique_text_change'] = int(tc.nunique())
     feats['n_unique_down_event']  = int(de.nunique())
-    feats['n_unique_up_event']    = int(ue.nunique())
 
     return feats
 
@@ -248,10 +234,10 @@ def _input_word_features(essay: pd.DataFrame) -> dict:
 
     return {
         'input_word_count':        len(lengths),
-        'input_word_length_mean':  np.mean(lengths)          if lengths else 0.0,
-        'input_word_length_max':   np.max(lengths)           if lengths else 0.0,
-        'input_word_length_std':   np.std(lengths)           if lengths else 0.0,
-        'input_word_length_skew':  float(_skew(lengths))     if lengths else 0.0,
+        'input_word_length_mean':  np.mean(lengths)      if lengths else 0.0,
+        'input_word_length_max':   np.max(lengths)       if lengths else 0.0,
+        'input_word_length_std':   np.std(lengths)       if lengths else 0.0,
+        'input_word_length_skew':  float(_skew(lengths)) if lengths else 0.0,
     }
 
 
@@ -285,13 +271,11 @@ def _timing_features(essay: pd.DataFrame) -> dict:
     cp = essay['cursor_position']
     feats['cursor_position_mean']   = float(cp.mean())
     feats['cursor_position_std']    = float(cp.std())
-    feats['cursor_position_max']    = float(cp.max())
     feats['cursor_position_median'] = float(cp.median())
     feats['cursor_position_q1']     = float(cp.quantile(0.25))
     feats['cursor_position_q3']     = float(cp.quantile(0.75))
 
     wc = essay['word_count']
-    feats['word_count_max']    = float(wc.max())
     feats['word_count_std']    = float(wc.std())
     feats['word_count_median'] = float(wc.median())
     feats['word_count_q1']     = float(wc.quantile(0.25))
@@ -303,7 +287,6 @@ def _timing_features(essay: pd.DataFrame) -> dict:
 # ── Steps 4–6: Burst and idle features ───────────────────────────────────────
 
 def _burst_sizes(bool_series: pd.Series) -> list:
-    """Return lengths of consecutive True runs in a boolean Series."""
     sizes, run = [], 0
     for v in bool_series:
         if v:
@@ -413,7 +396,6 @@ def _reconstruct_essay(essay: pd.DataFrame) -> str:
 # ── Steps 8–10: Text statistics ───────────────────────────────────────────────
 
 def _agg(values: list, prefix: str) -> dict:
-    """Descriptive stats for a list of numeric values."""
     if not values:
         names = ['count', 'mean', 'min', 'max', 'first', 'last', 'q1', 'median', 'q3', 'sum']
         return {f'{prefix}_{n}': 0.0 for n in names}
@@ -436,7 +418,7 @@ def _word_features(text: str) -> dict:
     raw_words = [w for w in re.split(r'[ \n\.\?\!]', text) if w]
     lengths   = [len(w) for w in raw_words]
     feats     = _agg(lengths, 'word_len')
-    feats.pop('word_len_min', None)   # always 1 or 0, no signal
+    feats.pop('word_len_min', None)
     return feats
 
 
@@ -456,8 +438,8 @@ def _sentence_features(text: str) -> dict:
 
     sent_wc_feats = _agg(sent_wc, 'sent_word_count')
     sent_wc_feats.pop('sent_word_count_count', None)
-    sent_wc_feats.pop('sent_word_count_min', None)   # gain < 15
-    sent_wc_feats.pop('sent_word_count_sum', None)   # gain < 15
+    sent_wc_feats.pop('sent_word_count_min', None)
+    sent_wc_feats.pop('sent_word_count_sum', None)
     feats.update(sent_wc_feats)
 
     return feats
@@ -494,6 +476,50 @@ def _efficiency_features(essay: pd.DataFrame, essay_text: str) -> dict:
     }
 
 
+# ── Step 12–13: Session duration + per-word normalisation ────────────────────
+
+def _normalize_counts(row: dict) -> dict:
+    word_count = max(row.get('word_len_count', 1), 1)
+
+    return {
+        # Punctuation & Formatting
+        'comma_per_word':        row.get('down_event_comma_cnt', 0)       / word_count,
+        'comma_text_per_word':   row.get('text_change_comma_cnt', 0)      / word_count,
+        'period_per_word':       row.get('down_event_period_cnt', 0)      / word_count,
+        'period_text_per_word':  row.get('text_change_period_cnt', 0)     / word_count,
+        'enter_per_word':        row.get('down_event_Enter_cnt', 0)       / word_count,
+        'newline_per_word':      row.get('text_change_newline_cnt', 0)    / word_count,
+        'shift_per_word':        row.get('down_event_Shift_cnt', 0)       / word_count,
+        'capslock_per_word':     row.get('down_event_CapsLock_cnt', 0)    / word_count,
+        'dash_per_word':         row.get('text_change_dash_cnt', 0)       / word_count,
+        'question_per_word':     row.get('text_change_question_cnt', 0)   / word_count,
+        'quote_per_word':        row.get('text_change_quote_cnt', 0)      / word_count,
+        # Typing Speed
+        'q_keys_per_word':       row.get('down_event_q_cnt', 0)           / word_count,
+        'q_text_per_word':       row.get('text_change_q_cnt', 0)          / word_count,
+        'space_per_word':        row.get('down_event_Space_cnt', 0)       / word_count,
+        'space_text_per_word':   row.get('text_change_space_cnt', 0)      / word_count,
+        # Pausing Behavior
+        'pauses_half_per_word':  row.get('pauses_half_sec', 0)            / word_count,
+        'pauses_1_per_word':     row.get('pauses_1_sec', 0)               / word_count,
+        'pauses_1half_per_word': row.get('pauses_1_half_sec', 0)          / word_count,
+        'pauses_2_per_word':     row.get('pauses_2_sec', 0)               / word_count,
+        'pauses_3_per_word':     row.get('pauses_3_sec', 0)               / word_count,
+        # Revision Behavior
+        'removecut_per_word':    row.get('activity_RemoveCut_cnt', 0)     / word_count,
+        'backspace_per_word':    row.get('down_event_Backspace_cnt', 0)   / word_count,
+        # Production Flow
+        'input_per_word':        row.get('activity_Input_cnt', 0)         / word_count,
+        'nonproduction_per_word':row.get('activity_Nonproduction_cnt', 0) / word_count,
+        'leftclick_per_word':    row.get('down_event_Leftclick_cnt', 0)   / word_count,
+        'arrowleft_per_word':    row.get('down_event_ArrowLeft_cnt', 0)   / word_count,
+        'arrowright_per_word':   row.get('down_event_ArrowRight_cnt', 0)  / word_count,
+        # Sentence & Burst
+        'sent_per_word':         row.get('sent_count', 0)                 / word_count,
+        'p_burst_per_word':      row.get('p_burst_count', 0)              / word_count,
+    }
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def compute_features(logs: pd.DataFrame) -> pd.DataFrame:
@@ -507,7 +533,7 @@ def compute_features(logs: pd.DataFrame) -> pd.DataFrame:
         # Step 1 — count specific keys, activities, and text-change characters
         row.update(_count_features(essay))
 
-        # Step 2 — word-length stats from typed q-sequences (no reconstruction needed)
+        # Step 2 — word-length stats from typed q-sequences
         row.update(_input_word_features(essay))
 
         # Step 3 — aggregate action_time, down_time, up_time, cursor, word_count
@@ -535,8 +561,14 @@ def compute_features(logs: pd.DataFrame) -> pd.DataFrame:
         # Step 10 — paragraph length and word-count stats from reconstructed text
         row.update(_paragraph_features(text))
 
-        # Step 11 — efficiency ratios (need both essay df and reconstructed text)
+        # Step 11 — efficiency ratios
         row.update(_efficiency_features(essay, text))
+
+        # Step 12 — session duration
+        row['session_duration_sec'] = (row.get('down_time_max', 0) - row.get('down_time_min', 0)) / 1000
+
+        # Step 13 — normalise count-based features per word
+        row.update(_normalize_counts(row))
 
         rows.append(row)
 
@@ -546,15 +578,15 @@ def compute_features(logs: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 # SECTION 1 – LOAD MODELS
 # =============================================================================
-model_paths = sorted(glob.glob(f'{MODELS_DIR}/lgbm_fold*.txt'))
+model_paths = sorted(glob.glob(f'{MODELS_DIR}/lgbm_s*_fold*.txt'))
 if not model_paths:
     raise FileNotFoundError(
         f"No fold models found in {MODELS_DIR}/\n"
-        "Upload lgbm_fold1.txt … lgbm_fold5.txt to the dataset."
+        "Upload lgbm_s42_fold1.txt … lgbm_s46_fold10.txt to the dataset."
     )
 
 models = [lgb.Booster(model_file=p) for p in model_paths]
-print(f"Loaded {len(models)} fold models from {MODELS_DIR}/")
+print(f"Loaded {len(models)} models from {MODELS_DIR}/ (average of all for final prediction)")
 
 # =============================================================================
 # SECTION 2 – FEATURE ENGINEERING
@@ -571,7 +603,6 @@ print(f"  Feature matrix: {X_test.shape[0]} essays × {X_test.shape[1]} features
 # =============================================================================
 # SECTION 3 – INFERENCE
 # =============================================================================
-# Average predictions from all 5 fold models (ensemble).
 print("\nRunning inference...")
 fold_preds = np.stack([model.predict(X_test) for model in models], axis=0)
 preds      = fold_preds.mean(axis=0)

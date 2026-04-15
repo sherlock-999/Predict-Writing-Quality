@@ -3,14 +3,22 @@
 # Data — too large for version control
 data/
 
-# Model weights — regenerate by running train_lgbm.py
+# Model weights — regenerate by running train_*.py
 models/
+v4_feature_lgbm/
+xgb_model/
+catboost_model/
 
 # Generated outputs
 eda_plots/
 lgbm_plots/
 xgb_plots/
+catboost_plots/
 submission.csv
+
+# Model file extensions
+*.cbm
+*.json
 
 # Python
 __pycache__/
@@ -32,3 +40,8 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+*.png
+*.txt
+
+catboost_info/

@@ -1,0 +1,734 @@
+"""
+Ensemble Inference: LightGBM + CatBoost → submission.csv  (Kaggle Submission)
+===============================================================================
+Self-contained script: all feature engineering logic is inlined.
+No local module imports required.
+
+Loads 50 LightGBM + 50 CatBoost fold models, averages predictions within each
+family, then blends the two using inverse-OOF-RMSE weighting.
+
+Feature set: v4_features (152 features = v2 base 119 + 33 new)
+  - Per-word normalised counts (same as v2 — NO verbosity/verbosity_per_word/
+    initial_pause/idle_smallest_latency/ts_* from v3)
+  - NEW cat 9: readability (ARI, Coleman-Liau), structural consistency (8 features)
+  - NEW cat 10: revision timing — where in session did deletions occur (5 features)
+  - NEW cat 11: TF-IDF SVD — 20 components of char 2–4-gram TF-IDF on
+                reconstructed text (captures punctuation rhythm)
+
+The TF-IDF SVD pipeline is loaded from a dedicated dataset (TFIDF_PATH).
+Both model families share the same transformer.
+
+Paths (Kaggle notebook environment):
+    DATA_DIR            = /kaggle/input/competitions/linking-writing-processes-to-writing-quality
+    LGBM_MODELS_DIR     = /kaggle/input/datasets/sherlocked999/v4-feature-lgbm/v4_feature_lgbm
+    CATBOOST_MODELS_DIR = /kaggle/input/datasets/sherlocked999/catboost-model/catboost_model
+    TFIDF_PATH          = /kaggle/input/datasets/sherlocked999/writing-quality-tfidf/tfidf/tfidf_svd.pkl
+    OUTPUT_PATH         = submission.csv
+"""
+
+import re
+import glob
+import pickle
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from catboost import CatBoostRegressor
+from scipy.stats import skew as _skew
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+DATA_DIR            = '/kaggle/input/competitions/linking-writing-processes-to-writing-quality'
+LGBM_MODELS_DIR     = '/kaggle/input/datasets/sherlocked999/v4-feature-lgbm/v4_feature_lgbm'
+CATBOOST_MODELS_DIR = '/kaggle/input/datasets/sherlocked999/catboost-model/catboost_model'
+TFIDF_PATH          = '/kaggle/input/datasets/sherlocked999/writing-quality-tfidf/tfidf/tfidf_svd.pkl'
+OUTPUT_PATH         = 'submission.csv'
+
+# OOF RMSEs from training — controls blend weight: lower RMSE → higher weight.
+# Replace these with actual values printed by each train_*.py script.
+OOF_RMSE_LGBM     = 0.6021
+OOF_RMSE_CATBOOST = 0.5983
+
+# ── TF-IDF config (must match training) ──────────────────────────────────────
+TFIDF_N_COMPONENTS = 20
+TFIDF_SVD_COLS     = [f'tfidf_svd_{i}' for i in range(TFIDF_N_COMPONENTS)]
+
+
+# =============================================================================
+# FEATURE COLUMNS  (v4 — 152 features)
+# =============================================================================
+
+FEATURE_COLS = [
+
+    # ── 1. WORD CHARACTERISTICS ───────────────────────────────────────────────
+    'word_len_sum',
+    'word_len_mean',
+    'word_len_q3',
+    'word_len_max',
+    'word_len_first',
+    'word_len_last',
+    'word_len_count',
+    'input_word_count',
+    'input_word_length_mean',
+    'input_word_length_max',
+    'input_word_length_std',
+    'input_word_length_skew',
+    'word_count_std',
+    'word_count_median',
+    'word_count_q1',
+    'word_count_q3',
+
+    # ── 2. SENTENCE CHARACTERISTICS ───────────────────────────────────────────
+    'sent_len_mean',
+    'sent_len_median',
+    'sent_len_min',
+    'sent_len_max',
+    'sent_len_first',
+    'sent_len_last',
+    'sent_len_q1',
+    'sent_len_q3',
+    'sent_per_word',
+    'sent_word_count_mean',
+    'sent_word_count_max',
+    'sent_word_count_first',
+    'sent_word_count_last',
+    'sent_word_count_q1',
+    'sent_word_count_median',
+    'sent_word_count_q3',
+
+    # ── 3. PARAGRAPH CHARACTERISTICS ──────────────────────────────────────────
+    'paragraph_len_mean',
+    'paragraph_len_median',
+    'paragraph_len_min',
+    'paragraph_len_max',
+    'paragraph_len_first',
+    'paragraph_len_last',
+    'paragraph_len_q1',
+    'paragraph_len_q3',
+    'paragraph_count',
+    'paragraph_word_count_mean',
+    'paragraph_word_count_min',
+    'paragraph_word_count_max',
+    'paragraph_word_count_first',
+    'paragraph_word_count_last',
+    'paragraph_word_count_q1',
+    'paragraph_word_count_median',
+    'paragraph_word_count_q3',
+
+    # ── 4. PUNCTUATION & FORMATTING ───────────────────────────────────────────
+    'comma_per_word',
+    'comma_text_per_word',
+    'period_per_word',
+    'period_text_per_word',
+    'enter_per_word',
+    'newline_per_word',
+    'shift_per_word',
+    'capslock_per_word',
+    'dash_per_word',
+    'question_per_word',
+    'quote_per_word',
+
+    # ── 5. TYPING SPEED & FLUENCY ─────────────────────────────────────────────
+    'keys_per_second',
+    'action_time_sum',
+    'action_time_mean',
+    'action_time_std',
+    'action_time_median',
+    'action_time_max',
+    'action_time_q1',
+    'action_time_q3',
+    'q_keys_per_word',
+    'q_text_per_word',
+    'space_per_word',
+    'space_text_per_word',
+    'n_unique_text_change',
+    'n_unique_down_event',
+
+    # ── 6. PAUSING BEHAVIOR ───────────────────────────────────────────────────
+    'idle_largest_latency',
+    'idle_median_latency',
+    'idle_mean',
+    'idle_std',
+    'idle_total',
+    'pauses_half_per_word',
+    'pauses_1_per_word',
+    'pauses_1half_per_word',
+    'pauses_2_per_word',
+    'pauses_3_per_word',
+
+    # ── 7. REVISION BEHAVIOR ──────────────────────────────────────────────────
+    'removecut_per_word',
+    'backspace_per_word',
+    'r_burst_mean',
+    'r_burst_std',
+    'r_burst_median',
+    'r_burst_max',
+    'r_burst_first',
+
+    # ── 8. PRODUCTION FLOW & NAVIGATION ──────────────────────────────────────
+    'input_per_word',
+    'nonproduction_per_word',
+    'p_burst_per_word',
+    'p_burst_mean',
+    'p_burst_std',
+    'p_burst_median',
+    'p_burst_max',
+    'p_burst_first',
+    'p_burst_last',
+    'product_to_keys',
+    'session_duration_sec',
+    'cursor_position_mean',
+    'cursor_position_std',
+    'cursor_position_median',
+    'cursor_position_q1',
+    'cursor_position_q3',
+    'leftclick_per_word',
+    'arrowleft_per_word',
+    'arrowright_per_word',
+    'down_time_min',
+    'down_time_mean',
+    'down_time_std',
+    'down_time_median',
+    'down_time_q1',
+    'down_time_q3',
+    'down_time_max',
+    'up_time_min',
+    'up_time_max',
+
+    # ── 9. READABILITY & STRUCTURAL CONSISTENCY ───────────────────────────────
+    'ari_score',
+    'coleman_liau_score',
+    'sent_len_std',
+    'sent_len_cv',
+    'para_len_std',
+    'para_len_cv',
+    'para_balance',
+    'words_per_minute',
+
+    # ── 10. REVISION TIMING ───────────────────────────────────────────────────
+    'revision_ratio_early',
+    'revision_ratio_mid',
+    'revision_ratio_late',
+    'revision_timing_mean',
+    'revision_timing_std',
+
+    # ── 11. TF-IDF SVD (char bigrams on reconstructed text) ──────────────────
+    *TFIDF_SVD_COLS,   # tfidf_svd_0 … tfidf_svd_19
+]
+
+
+# =============================================================================
+# FEATURE ENGINEERING  (all logic inlined — no local imports)
+# =============================================================================
+
+def _count_features(essay: pd.DataFrame) -> dict:
+    act = essay['activity']
+    tc  = essay['text_change']
+    de  = essay['down_event']
+
+    feats = {}
+
+    for value, key in [
+        ('Input',         'activity_Input_cnt'),
+        ('Remove/Cut',    'activity_RemoveCut_cnt'),
+        ('Nonproduction', 'activity_Nonproduction_cnt'),
+    ]:
+        feats[key] = int((act == value).sum())
+
+    for value, key in [
+        ('q',  'text_change_q_cnt'),
+        (' ',  'text_change_space_cnt'),
+        ('.',  'text_change_period_cnt'),
+        (',',  'text_change_comma_cnt'),
+        ('\n', 'text_change_newline_cnt'),
+        ("'",  'text_change_quote_cnt'),
+        ('-',  'text_change_dash_cnt'),
+        ('?',  'text_change_question_cnt'),
+    ]:
+        feats[key] = int((tc == value).sum())
+
+    for value, key in [
+        ('q',          'down_event_q_cnt'),
+        ('Space',      'down_event_Space_cnt'),
+        ('Backspace',  'down_event_Backspace_cnt'),
+        ('Shift',      'down_event_Shift_cnt'),
+        ('ArrowRight', 'down_event_ArrowRight_cnt'),
+        ('Leftclick',  'down_event_Leftclick_cnt'),
+        ('ArrowLeft',  'down_event_ArrowLeft_cnt'),
+        ('.',          'down_event_period_cnt'),
+        (',',          'down_event_comma_cnt'),
+        ('Enter',      'down_event_Enter_cnt'),
+        ('CapsLock',   'down_event_CapsLock_cnt'),
+    ]:
+        feats[key] = int((de == value).sum())
+
+    feats['n_unique_text_change'] = int(tc.nunique())
+    feats['n_unique_down_event']  = int(de.nunique())
+
+    return feats
+
+
+def _input_word_features(essay: pd.DataFrame) -> dict:
+    plain_input = essay[
+        ~essay['text_change'].str.contains('=>', na=False) &
+        (essay['text_change'] != 'NoChange')
+    ]['text_change'].str.cat(sep='')
+
+    word_seqs = re.findall(r'q+', plain_input)
+    lengths   = [len(w) for w in word_seqs]
+
+    return {
+        'input_word_count':        len(lengths),
+        'input_word_length_mean':  np.mean(lengths)      if lengths else 0.0,
+        'input_word_length_max':   np.max(lengths)       if lengths else 0.0,
+        'input_word_length_std':   np.std(lengths)       if lengths else 0.0,
+        'input_word_length_skew':  float(_skew(lengths)) if lengths else 0.0,
+    }
+
+
+def _timing_features(essay: pd.DataFrame) -> dict:
+    feats = {}
+
+    at = essay['action_time']
+    feats['action_time_sum']    = float(at.sum())
+    feats['action_time_mean']   = float(at.mean())
+    feats['action_time_std']    = float(at.std())
+    feats['action_time_median'] = float(at.median())
+    feats['action_time_max']    = float(at.max())
+    feats['action_time_q1']     = float(at.quantile(0.25))
+    feats['action_time_q3']     = float(at.quantile(0.75))
+
+    dt = essay['down_time']
+    feats['down_time_min']    = float(dt.min())
+    feats['down_time_mean']   = float(dt.mean())
+    feats['down_time_std']    = float(dt.std())
+    feats['down_time_median'] = float(dt.median())
+    feats['down_time_q1']     = float(dt.quantile(0.25))
+    feats['down_time_q3']     = float(dt.quantile(0.75))
+    feats['down_time_max']    = float(dt.max())
+
+    ut = essay['up_time']
+    feats['up_time_min'] = float(ut.min())
+    feats['up_time_max'] = float(ut.max())
+
+    cp = essay['cursor_position']
+    feats['cursor_position_mean']   = float(cp.mean())
+    feats['cursor_position_std']    = float(cp.std())
+    feats['cursor_position_median'] = float(cp.median())
+    feats['cursor_position_q1']     = float(cp.quantile(0.25))
+    feats['cursor_position_q3']     = float(cp.quantile(0.75))
+
+    wc = essay['word_count']
+    feats['word_count_std']    = float(wc.std())
+    feats['word_count_median'] = float(wc.median())
+    feats['word_count_q1']     = float(wc.quantile(0.25))
+    feats['word_count_q3']     = float(wc.quantile(0.75))
+
+    return feats
+
+
+def _burst_sizes(bool_series: pd.Series) -> list:
+    sizes, run = [], 0
+    for v in bool_series:
+        if v:
+            run += 1
+        elif run:
+            sizes.append(run)
+            run = 0
+    if run:
+        sizes.append(run)
+    return sizes
+
+
+def _idle_features(essay: pd.DataFrame) -> dict:
+    df = essay.copy()
+    df['up_time_lagged'] = df['up_time'].shift(1)
+    df['gap_sec'] = ((df['down_time'] - df['up_time_lagged']).abs() / 1000).fillna(0)
+    df = df[df['activity'].isin(['Input', 'Remove/Cut'])]
+    gaps = df['gap_sec'].dropna()
+
+    return {
+        'idle_largest_latency':  float(gaps.max())    if len(gaps) else 0.0,
+        'idle_smallest_latency': float(gaps.min())    if len(gaps) else 0.0,
+        'idle_median_latency':   float(gaps.median()) if len(gaps) else 0.0,
+        'idle_mean':             float(gaps.mean())   if len(gaps) else 0.0,
+        'idle_std':              float(gaps.std())    if len(gaps) else 0.0,
+        'idle_total':            float(gaps.sum())    if len(gaps) else 0.0,
+        'pauses_half_sec':       int(((gaps > 0.5) & (gaps < 1.0)).sum()),
+        'pauses_1_sec':          int(((gaps > 1.0) & (gaps < 1.5)).sum()),
+        'pauses_1_half_sec':     int(((gaps > 1.5) & (gaps < 2.0)).sum()),
+        'pauses_2_sec':          int(((gaps > 2.0) & (gaps < 3.0)).sum()),
+        'pauses_3_sec':          int((gaps > 3.0).sum()),
+    }
+
+
+def _p_burst_features(essay: pd.DataFrame) -> dict:
+    df = essay.copy()
+    df['up_time_lagged'] = df['up_time'].shift(1)
+    df['gap_sec'] = ((df['down_time'] - df['up_time_lagged']).abs() / 1000).fillna(0)
+    df = df[df['activity'].isin(['Input', 'Remove/Cut'])].copy()
+    df['in_burst'] = df['gap_sec'] < 2
+    sizes = _burst_sizes(df['in_burst'])
+    return {
+        'p_burst_count':  len(sizes),
+        'p_burst_mean':   float(np.mean(sizes))   if sizes else 0.0,
+        'p_burst_std':    float(np.std(sizes))    if sizes else 0.0,
+        'p_burst_median': float(np.median(sizes)) if sizes else 0.0,
+        'p_burst_max':    float(np.max(sizes))    if sizes else 0.0,
+        'p_burst_first':  float(sizes[0])         if sizes else 0.0,
+        'p_burst_last':   float(sizes[-1])        if sizes else 0.0,
+    }
+
+
+def _r_burst_features(essay: pd.DataFrame) -> dict:
+    df = essay[essay['activity'].isin(['Input', 'Remove/Cut'])].copy()
+    df['is_remove'] = df['activity'] == 'Remove/Cut'
+    sizes = _burst_sizes(df['is_remove'])
+    return {
+        'r_burst_mean':   float(np.mean(sizes))   if sizes else 0.0,
+        'r_burst_std':    float(np.std(sizes))    if sizes else 0.0,
+        'r_burst_median': float(np.median(sizes)) if sizes else 0.0,
+        'r_burst_max':    float(np.max(sizes))    if sizes else 0.0,
+        'r_burst_first':  float(sizes[0])         if sizes else 0.0,
+    }
+
+
+def _reconstruct_essay(essay: pd.DataFrame) -> str:
+    text = ""
+    for _, row in essay[['activity', 'cursor_position', 'text_change']].iterrows():
+        act = row['activity']
+        cur = row['cursor_position']
+        tc  = row['text_change']
+
+        if act == 'Replace':
+            parts = tc.split(' => ')
+            if len(parts) == 2:
+                old, new = parts
+                text = text[:cur - len(new)] + new + text[cur - len(new) + len(old):]
+        elif act == 'Paste':
+            text = text[:cur - len(tc)] + tc + text[cur - len(tc):]
+        elif act == 'Remove/Cut':
+            text = text[:cur] + text[cur + len(tc):]
+        elif act.startswith('Move From'):
+            try:
+                crp  = act[10:]
+                spl  = crp.split(' To ')
+                vals = [v.split(', ') for v in spl]
+                x1, y1 = int(vals[0][0][1:]), int(vals[0][1][:-1])
+                x2, y2 = int(vals[1][0][1:]), int(vals[1][1][:-1])
+                if x1 != x2:
+                    if x1 < x2:
+                        text = text[:x1] + text[y1:y2] + text[x1:y1] + text[y2:]
+                    else:
+                        text = text[:x2] + text[x1:y1] + text[x2:x1] + text[y1:]
+            except Exception:
+                pass
+        else:
+            text = text[:cur - len(tc)] + tc + text[cur - len(tc):]
+
+    return text
+
+
+def _agg(values: list, prefix: str) -> dict:
+    if not values:
+        names = ['count', 'mean', 'min', 'max', 'first', 'last', 'q1', 'median', 'q3', 'sum']
+        return {f'{prefix}_{n}': 0.0 for n in names}
+    arr = np.array(values, dtype=float)
+    return {
+        f'{prefix}_count':  len(arr),
+        f'{prefix}_mean':   arr.mean(),
+        f'{prefix}_min':    arr.min(),
+        f'{prefix}_max':    arr.max(),
+        f'{prefix}_first':  arr[0],
+        f'{prefix}_last':   arr[-1],
+        f'{prefix}_q1':     np.percentile(arr, 25),
+        f'{prefix}_median': np.median(arr),
+        f'{prefix}_q3':     np.percentile(arr, 75),
+        f'{prefix}_sum':    arr.sum(),
+    }
+
+
+def _word_features(text: str) -> dict:
+    raw_words = [w for w in re.split(r'[ \n\.\?\!]', text) if w]
+    lengths   = [len(w) for w in raw_words]
+    feats     = _agg(lengths, 'word_len')
+    feats.pop('word_len_min', None)
+    return feats
+
+
+def _sentence_features(text: str) -> dict:
+    raw_sents = [s.replace('\n', '').strip()
+                 for s in re.split(r'[\.\?\!]', text)
+                 if s.strip()]
+
+    sent_lens = [len(s)         for s in raw_sents]
+    sent_wc   = [len(s.split()) for s in raw_sents]
+
+    feats = {'sent_count': len(raw_sents)}
+
+    sent_len_feats = _agg(sent_lens, 'sent_len')
+    sent_len_feats.pop('sent_len_count', None)
+    feats.update(sent_len_feats)
+
+    sent_wc_feats = _agg(sent_wc, 'sent_word_count')
+    sent_wc_feats.pop('sent_word_count_count', None)
+    sent_wc_feats.pop('sent_word_count_min', None)
+    sent_wc_feats.pop('sent_word_count_sum', None)
+    feats.update(sent_wc_feats)
+
+    return feats
+
+
+def _paragraph_features(text: str) -> dict:
+    raw_paras = [p.strip() for p in text.split('\n') if p.strip()]
+
+    para_lens = [len(p)         for p in raw_paras]
+    para_wc   = [len(p.split()) for p in raw_paras]
+
+    feats = {'paragraph_count': len(raw_paras)}
+
+    para_len_feats = _agg(para_lens, 'paragraph_len')
+    para_len_feats.pop('paragraph_len_count', None)
+    feats.update(para_len_feats)
+
+    para_wc_feats = _agg(para_wc, 'paragraph_word_count')
+    para_wc_feats.pop('paragraph_word_count_count', None)
+    feats.update(para_wc_feats)
+
+    return feats
+
+
+def _efficiency_features(essay: pd.DataFrame, essay_text: str) -> dict:
+    keys_pressed    = int(essay['activity'].isin(['Input', 'Remove/Cut']).sum())
+    session_seconds = (essay['up_time'].max() - essay['down_time'].min()) / 1000
+    return {
+        'product_to_keys': len(essay_text) / max(keys_pressed, 1),
+        'keys_per_second': keys_pressed    / max(session_seconds, 1),
+    }
+
+
+def _normalize_counts(row: dict) -> dict:
+    word_count = max(row.get('word_len_count', 1), 1)
+    return {
+        'comma_per_word':        row.get('down_event_comma_cnt', 0)       / word_count,
+        'comma_text_per_word':   row.get('text_change_comma_cnt', 0)      / word_count,
+        'period_per_word':       row.get('down_event_period_cnt', 0)      / word_count,
+        'period_text_per_word':  row.get('text_change_period_cnt', 0)     / word_count,
+        'enter_per_word':        row.get('down_event_Enter_cnt', 0)       / word_count,
+        'newline_per_word':      row.get('text_change_newline_cnt', 0)    / word_count,
+        'shift_per_word':        row.get('down_event_Shift_cnt', 0)       / word_count,
+        'capslock_per_word':     row.get('down_event_CapsLock_cnt', 0)    / word_count,
+        'dash_per_word':         row.get('text_change_dash_cnt', 0)       / word_count,
+        'question_per_word':     row.get('text_change_question_cnt', 0)   / word_count,
+        'quote_per_word':        row.get('text_change_quote_cnt', 0)      / word_count,
+        'q_keys_per_word':       row.get('down_event_q_cnt', 0)           / word_count,
+        'q_text_per_word':       row.get('text_change_q_cnt', 0)          / word_count,
+        'space_per_word':        row.get('down_event_Space_cnt', 0)       / word_count,
+        'space_text_per_word':   row.get('text_change_space_cnt', 0)      / word_count,
+        'pauses_half_per_word':  row.get('pauses_half_sec', 0)            / word_count,
+        'pauses_1_per_word':     row.get('pauses_1_sec', 0)               / word_count,
+        'pauses_1half_per_word': row.get('pauses_1_half_sec', 0)          / word_count,
+        'pauses_2_per_word':     row.get('pauses_2_sec', 0)               / word_count,
+        'pauses_3_per_word':     row.get('pauses_3_sec', 0)               / word_count,
+        'removecut_per_word':    row.get('activity_RemoveCut_cnt', 0)     / word_count,
+        'backspace_per_word':    row.get('down_event_Backspace_cnt', 0)   / word_count,
+        'input_per_word':        row.get('activity_Input_cnt', 0)         / word_count,
+        'nonproduction_per_word':row.get('activity_Nonproduction_cnt', 0) / word_count,
+        'leftclick_per_word':    row.get('down_event_Leftclick_cnt', 0)   / word_count,
+        'arrowleft_per_word':    row.get('down_event_ArrowLeft_cnt', 0)   / word_count,
+        'arrowright_per_word':   row.get('down_event_ArrowRight_cnt', 0)  / word_count,
+        'sent_per_word':         row.get('sent_count', 0)                 / word_count,
+        'p_burst_per_word':      row.get('p_burst_count', 0)              / word_count,
+    }
+
+
+def _readability_features(text: str, row: dict) -> dict:
+    chars  = len(re.sub(r'\s', '', text))
+    words  = max(row.get('word_len_count', 1), 1)
+    sents  = max(row.get('sent_count', 1), 1)
+
+    ari = 4.71 * (chars / words) + 0.5 * (words / sents) - 21.43
+
+    L   = (chars / words) * 100
+    S   = (sents / words) * 100
+    cli = 0.0588 * L - 0.296 * S - 15.8
+
+    raw_sents = [s.strip() for s in re.split(r'[\.\?\!]', text) if s.strip()]
+    sent_lens = np.array([len(s) for s in raw_sents], dtype=float)
+    sent_std  = float(sent_lens.std())  if len(sent_lens) > 1 else 0.0
+    sent_cv   = float(sent_std / (sent_lens.mean() + 1e-9))
+
+    raw_paras = [p.strip() for p in text.split('\n') if p.strip()]
+    para_lens = np.array([len(p) for p in raw_paras], dtype=float)
+    para_std  = float(para_lens.std())  if len(para_lens) > 1 else 0.0
+    para_cv   = float(para_std / (para_lens.mean() + 1e-9))
+
+    para_wc  = np.array([len(p.split()) for p in raw_paras], dtype=float)
+    para_bal = float(para_wc.std()) if len(para_wc) > 1 else 0.0
+
+    dur_min = max(row.get('session_duration_sec', 1), 1) / 60.0
+    wpm     = words / dur_min
+
+    return {
+        'ari_score':          float(ari),
+        'coleman_liau_score': float(cli),
+        'sent_len_std':       sent_std,
+        'sent_len_cv':        sent_cv,
+        'para_len_std':       para_std,
+        'para_len_cv':        para_cv,
+        'para_balance':       para_bal,
+        'words_per_minute':   float(wpm),
+    }
+
+
+def _revision_timing_features(essay: pd.DataFrame) -> dict:
+    t_min = essay['down_time'].min()
+    t_max = essay['down_time'].max()
+    t_dur = max(t_max - t_min, 1)
+
+    remove_events = essay[essay['activity'] == 'Remove/Cut']['down_time']
+
+    if remove_events.empty:
+        return {
+            'revision_ratio_early': 0.0,
+            'revision_ratio_mid':   0.0,
+            'revision_ratio_late':  0.0,
+            'revision_timing_mean': 0.0,
+            'revision_timing_std':  0.0,
+        }
+
+    norm_times = (remove_events - t_min) / t_dur
+    total      = len(norm_times)
+
+    return {
+        'revision_ratio_early': float((norm_times < 1/3).sum())                         / total,
+        'revision_ratio_mid':   float(((norm_times >= 1/3) & (norm_times < 2/3)).sum()) / total,
+        'revision_ratio_late':  float((norm_times >= 2/3).sum())                        / total,
+        'revision_timing_mean': float(norm_times.mean()),
+        'revision_timing_std':  float(norm_times.std()) if total > 1 else 0.0,
+    }
+
+
+def compute_features(logs: pd.DataFrame, tfidf_pipeline) -> pd.DataFrame:
+    logs = logs.sort_values(['id', 'event_id']).reset_index(drop=True)
+
+    rows  = []
+    texts = {}
+
+    for essay_id, essay in logs.groupby('id'):
+        essay = essay.reset_index(drop=True)
+        row   = {'id': essay_id}
+
+        row.update(_count_features(essay))
+        row.update(_input_word_features(essay))
+        row.update(_timing_features(essay))
+        row.update(_idle_features(essay))
+        row.update(_p_burst_features(essay))
+        row.update(_r_burst_features(essay))
+
+        non_nonproduction = essay[essay['activity'] != 'Nonproduction']
+        text = _reconstruct_essay(non_nonproduction)
+        texts[essay_id] = text
+
+        row.update(_word_features(text))
+        row.update(_sentence_features(text))
+        row.update(_paragraph_features(text))
+        row.update(_efficiency_features(essay, text))
+
+        row['session_duration_sec'] = (
+            row.get('down_time_max', 0) - row.get('down_time_min', 0)
+        ) / 1000
+
+        row.update(_normalize_counts(row))
+        row.update(_readability_features(text, row))
+        row.update(_revision_timing_features(essay))
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows).fillna(0)
+
+    corpus     = [texts[eid] for eid in df['id']]
+    svd_matrix = tfidf_pipeline.transform(corpus)
+    svd_df     = pd.DataFrame(svd_matrix, columns=TFIDF_SVD_COLS)
+    svd_df['id'] = df['id'].values
+    df = df.merge(svd_df, on='id', how='left')
+
+    return df[['id'] + FEATURE_COLS].fillna(0)
+
+
+# =============================================================================
+# SECTION 1 – LOAD SHARED TF-IDF PIPELINE
+# =============================================================================
+print(f"Loading TF-IDF SVD pipeline from {TFIDF_PATH}...")
+with open(TFIDF_PATH, 'rb') as f:
+    tfidf_pipeline = pickle.load(f)
+
+# =============================================================================
+# SECTION 2 – LOAD MODELS
+# =============================================================================
+
+# LightGBM
+lgbm_paths = sorted(glob.glob(f'{LGBM_MODELS_DIR}/lgbm_s*_fold*.txt'))
+if not lgbm_paths:
+    raise FileNotFoundError(
+        f"No LightGBM models found in {LGBM_MODELS_DIR}/\n"
+        "Upload lgbm_s42_fold1.txt … lgbm_s4_fold10.txt to the dataset."
+    )
+lgbm_models = [lgb.Booster(model_file=p) for p in lgbm_paths]
+print(f"Loaded {len(lgbm_models)} LightGBM models from {LGBM_MODELS_DIR}/")
+
+# CatBoost
+cb_paths = sorted(glob.glob(f'{CATBOOST_MODELS_DIR}/catboost_s*_fold*.cbm'))
+if not cb_paths:
+    raise FileNotFoundError(
+        f"No CatBoost models found in {CATBOOST_MODELS_DIR}/\n"
+        "Upload catboost_s42_fold1.cbm … catboost_s4_fold10.cbm to the dataset."
+    )
+cb_models = []
+for p in cb_paths:
+    m = CatBoostRegressor()
+    m.load_model(p)
+    cb_models.append(m)
+print(f"Loaded {len(cb_models)} CatBoost models from {CATBOOST_MODELS_DIR}/")
+
+# =============================================================================
+# SECTION 3 – FEATURE ENGINEERING
+# =============================================================================
+print("\nLoading test_logs.csv...")
+logs = pd.read_csv(f'{DATA_DIR}/test_logs.csv')
+print(f"  {logs.shape[0]:,} rows | {logs['id'].nunique()} essays")
+
+print("Computing per-essay features (v4)...")
+test_df = compute_features(logs, tfidf_pipeline).fillna(0)
+X_test  = test_df[FEATURE_COLS].values
+print(f"  Feature matrix: {X_test.shape[0]} essays × {X_test.shape[1]} features")
+
+# =============================================================================
+# SECTION 4 – PREDICT PER MODEL FAMILY
+# =============================================================================
+lgbm_preds = np.stack([m.predict(X_test) for m in lgbm_models], axis=0).mean(axis=0)
+cb_preds   = np.stack([m.predict(X_test) for m in cb_models],   axis=0).mean(axis=0)
+
+print(f"\nLightGBM — mean: {lgbm_preds.mean():.3f} | std: {lgbm_preds.std():.3f}")
+print(f"CatBoost — mean: {cb_preds.mean():.3f}   | std: {cb_preds.std():.3f}")
+
+# =============================================================================
+# SECTION 5 – BLEND  (inverse-RMSE weighting)
+# =============================================================================
+w_lgbm     = 1.0 / OOF_RMSE_LGBM
+w_catboost = 1.0 / OOF_RMSE_CATBOOST
+w_total    = w_lgbm + w_catboost
+
+preds = (w_lgbm * lgbm_preds + w_catboost * cb_preds) / w_total
+preds = np.clip(preds, 0.5, 6.0)
+
+print(f"\nBlend weights — LightGBM: {w_lgbm/w_total:.3f} | CatBoost: {w_catboost/w_total:.3f}")
+print(f"Ensemble — mean: {preds.mean():.3f} | std: {preds.std():.3f} "
+      f"| min: {preds.min():.3f} | max: {preds.max():.3f}")
+
+# =============================================================================
+# SECTION 6 – WRITE SUBMISSION
+# =============================================================================
+submission = pd.DataFrame({'id': test_df['id'], 'score': preds})
+submission.to_csv(OUTPUT_PATH, index=False)
+print(f"\nSubmission saved to: {OUTPUT_PATH}")
+print(f"  {len(submission)} rows")
+print(submission.head(10).to_string(index=False))
