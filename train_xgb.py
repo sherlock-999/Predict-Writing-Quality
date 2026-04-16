@@ -244,15 +244,14 @@ def plot_importance(imp_series, feat_names, title, filename, xlabel):
     sorted_v = imp_series[order]
     colors   = [CAT_PALETTE[CATEGORIES[f]] for f in sorted_f]
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(10, max(8, len(feat_names) * 0.18)))
     bars = ax.barh(sorted_f, sorted_v, color=colors, edgecolor='white')
     ax.set_xlabel(xlabel, fontsize=11)
     ax.set_title(title, fontsize=12, fontweight='bold')
     total = sorted_v.sum()
     for bar, v in zip(bars, sorted_v):
-        if total > 0:
-            ax.text(v + total * 0.003, bar.get_y() + bar.get_height() / 2,
-                    f'{v / total * 100:.1f}%', va='center', ha='left', fontsize=8)
+        ax.text(v + total * 0.003, bar.get_y() + bar.get_height() / 2,
+                f'{v / total * 100:.1f}%', va='center', ha='left', fontsize=7)
     ax.legend(handles=legend_elements, loc='lower right', fontsize=9, title='Category')
     plt.tight_layout()
     plt.savefig(os.path.join(PLOT_DIR, filename), dpi=150)
