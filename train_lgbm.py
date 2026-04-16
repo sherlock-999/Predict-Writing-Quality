@@ -29,14 +29,16 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_squared_error
-from v4_features import compute_features, FEATURE_COLS, CATEGORIES, CAT_PALETTE
+from v6_features import compute_features, FEATURE_COLS, CATEGORIES, CAT_PALETTE
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(__file__)
 DATA_DIR   = os.path.join(BASE_DIR, 'data')
-MODELS_DIR  = os.path.join(BASE_DIR, 'v4_feature_lgbm')
+MODELS_DIR  = os.path.join(BASE_DIR, 'v6_features_lgbm')
 PLOT_DIR    = os.path.join(BASE_DIR, 'lgbm_plots')
-TFIDF_PATH  = os.path.join(MODELS_DIR, 'tfidf', 'tfidf_svd.pkl')
+TFIDF_DIR        = os.path.join(MODELS_DIR, 'tfidf_v6')
+TFIDF_PATH       = os.path.join(TFIDF_DIR, 'tfidf_svd.pkl')
+EVENT_TFIDF_PATH = os.path.join(TFIDF_DIR, 'event_tfidf_svd.pkl')
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(PLOT_DIR, exist_ok=True)
 
@@ -54,7 +56,7 @@ if os.path.exists(best_params_path):
 else:
     print("lgbm_best_params.json not found — using default params")
     best_params = {
-        'num_leaves':        31,
+    'num_leaves':        31,
         'min_child_samples': 20,
         'learning_rate':     0.05,
         'feature_fraction':  0.8,
@@ -66,62 +68,21 @@ else:
 
 LGBM_PARAMS = {
     'num_leaves':        31,
-        'min_child_samples': 20,
-        'learning_rate':     0.05,
-        'feature_fraction':  0.8,
-        'bagging_fraction':  0.8,
-        'bagging_freq':      1,
-        'lambda_l1':         0.1,
-        'lambda_l2':         0.1,
+    'min_child_samples': 20,
+    'learning_rate':     0.05,
+    'feature_fraction':  0.8,
+    'bagging_fraction':  0.8,
+    'bagging_freq':      1,
+    'lambda_l1':         0.1,
+    'lambda_l2':         0.1,
 }
-'''
-{
-    'n_estimators':      1000,       # high ceiling — early stopping finds actual optimum
-    'objective':         'regression',
-    'metric':            'rmse',
-    'num_leaves':        24,
-    'min_child_samples': 5,
-    'learning_rate':     0.005,
-    'colsample_bytree':  0.41,
-    'subsample':         0.98,
-    'reg_alpha':         0.018,
-    'reg_lambda':        0.675,
-    'force_col_wise':    True,
-    'verbosity':         0,
-}
-
-{
-    'n_estimators': 1024,
-    'learning_rate': 0.005,
-    'metric': 'rmse',
-    'random_state': 42,
-    'force_col_wise': True,
-    'verbosity': 0, 
-    'num_leaves': 24, 
-}
-{'reg_alpha': 0.007678095440286993, 
-               'reg_lambda': 0.34230534302168353, 
-               'colsample_bytree': 0.627061253588415, 
-               'subsample': 0.854942238828458, 
-               'learning_rate': 0.038697981947473245, 
-               'num_leaves': 22, 
-               'max_depth': 37, 
-               'min_child_samples': 18,
-               'random_state': BASE_SEED ,
-               'n_estimators': 150,
-               "objective": "regression",
-               "metric": "rmse",
-               'force_col_wise': True,
-               "verbosity": 0,
-              }
-'''
 
 
 
 # =============================================================================
 # SECTION 1 – LOAD DATA
 # =============================================================================
-features_cache = os.path.join(DATA_DIR, 'train_features_v4.csv')
+features_cache = os.path.join(DATA_DIR, 'train_features_v6.csv')
 
 if os.path.exists(features_cache):
     print(f"\nLoading precomputed features from {features_cache}...")
@@ -131,11 +92,15 @@ else:
     print("  (run precompute_features.py first to speed this up)")
     logs   = pd.read_csv(os.path.join(DATA_DIR, 'train_logs.csv'))
     scores = pd.read_csv(os.path.join(DATA_DIR, 'train_scores.csv'))
-    feat_df, tfidf_pipeline = compute_features(logs)
+    feat_df, tfidf_pipeline, event_tfidf_pipeline = compute_features(logs)
     df = feat_df.merge(scores, on='id').fillna(0)
+    os.makedirs(TFIDF_DIR, exist_ok=True)
     with open(TFIDF_PATH, 'wb') as f:
         pickle.dump(tfidf_pipeline, f)
-    print(f"  Saved TF-IDF SVD pipeline → {TFIDF_PATH}")
+    print(f"  Saved text TF-IDF SVD pipeline  → {TFIDF_PATH}")
+    with open(EVENT_TFIDF_PATH, 'wb') as f:
+        pickle.dump(event_tfidf_pipeline, f)
+    print(f"  Saved event TF-IDF SVD pipeline → {EVENT_TFIDF_PATH}")
 
 print(f"  {df.shape[0]} essays × {len(FEATURE_COLS)} features")
 

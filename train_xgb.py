@@ -29,14 +29,16 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_squared_error
-from v4_features import compute_features, FEATURE_COLS, CATEGORIES, CAT_PALETTE
+from v6_features import compute_features, FEATURE_COLS, CATEGORIES, CAT_PALETTE
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(__file__)
 DATA_DIR   = os.path.join(BASE_DIR, 'data')
 MODELS_DIR  = os.path.join(BASE_DIR, 'xgb_model')
 PLOT_DIR    = os.path.join(BASE_DIR, 'xgb_plots')
-TFIDF_PATH  = os.path.join(MODELS_DIR, 'tfidf', 'tfidf_svd.pkl')
+TFIDF_DIR        = os.path.join(MODELS_DIR, 'tfidf_v6')
+TFIDF_PATH       = os.path.join(TFIDF_DIR, 'tfidf_svd.pkl')
+EVENT_TFIDF_PATH = os.path.join(TFIDF_DIR, 'event_tfidf_svd.pkl')
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(PLOT_DIR, exist_ok=True)
 
@@ -47,7 +49,7 @@ SEEDS   = [42, 21, 2022, 7, 4]   # diverse seeds for better ensemble
 # =============================================================================
 # SECTION 1 – LOAD DATA
 # =============================================================================
-features_cache = os.path.join(DATA_DIR, 'train_features_v4.csv')
+features_cache = os.path.join(DATA_DIR, 'train_features_v6.csv')
 
 if os.path.exists(features_cache):
     print(f"\nLoading precomputed features from {features_cache}...")
@@ -57,11 +59,15 @@ else:
     print("  (run precompute_features.py first to speed this up)")
     logs   = pd.read_csv(os.path.join(DATA_DIR, 'train_logs.csv'))
     scores = pd.read_csv(os.path.join(DATA_DIR, 'train_scores.csv'))
-    feat_df, tfidf_pipeline = compute_features(logs)
+    feat_df, tfidf_pipeline, event_tfidf_pipeline = compute_features(logs)
     df = feat_df.merge(scores, on='id').fillna(0)
+    os.makedirs(TFIDF_DIR, exist_ok=True)
     with open(TFIDF_PATH, 'wb') as f:
         pickle.dump(tfidf_pipeline, f)
-    print(f"  Saved TF-IDF SVD pipeline → {TFIDF_PATH}")
+    print(f"  Saved text TF-IDF SVD pipeline  → {TFIDF_PATH}")
+    with open(EVENT_TFIDF_PATH, 'wb') as f:
+        pickle.dump(event_tfidf_pipeline, f)
+    print(f"  Saved event TF-IDF SVD pipeline → {EVENT_TFIDF_PATH}")
 
 print(f"  {df.shape[0]} essays × {len(FEATURE_COLS)} features")
 

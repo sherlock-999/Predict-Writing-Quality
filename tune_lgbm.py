@@ -31,22 +31,22 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_squared_error
-from writing_process.v3_features import compute_features, FEATURE_COLS
+from v5_features import compute_features, FEATURE_COLS
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(__file__)
 DATA_DIR   = os.path.join(BASE_DIR, 'data')
-MODELS_DIR = os.path.join(BASE_DIR, 'models')
+MODELS_DIR = os.path.join(BASE_DIR, 'tuned_lgbm')
 PLOT_DIR   = os.path.join(BASE_DIR, 'lgbm_plots_test_new')
-FEATURES_FILENAME = 'train_features.csv'
+FEATURES_FILENAME = 'train_features_v5.csv'
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 # ── Tuning config ─────────────────────────────────────────────────────────────
-N_TRIALS  = 100   # number of Optuna trials
+N_TRIALS  = 50   # number of Optuna trials
 N_FOLDS   = 10     # CV folds per trial
 SEED      = 42
 

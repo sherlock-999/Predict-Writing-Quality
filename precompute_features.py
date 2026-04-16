@@ -18,11 +18,11 @@ Usage:
 import os
 import pickle
 import pandas as pd
-from v4_features import compute_features
+from v6_features import compute_features
 
 BASE_DIR   = os.path.dirname(__file__)
 DATA_DIR   = os.path.join(BASE_DIR, 'data')
-MODELS_DIR = os.path.join(BASE_DIR, 'models')
+MODELS_DIR = os.path.join(BASE_DIR, 'tfidf_updated')
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # =============================================================================
@@ -37,7 +37,7 @@ print("Computing train features (fits TF-IDF SVD on training corpus)...")
 train_feat_df, tfidf_pipeline = compute_features(train_logs)
 train_df = train_feat_df.merge(train_scores, on='id').fillna(0)
 
-out_path = os.path.join(DATA_DIR, 'train_features_v4.csv')
+out_path = os.path.join(DATA_DIR, 'train_features_v6.csv')
 train_df.to_csv(out_path, index=False)
 print(f"  Saved {train_df.shape[0]} essays × {train_df.shape[1]} columns → {out_path}")
 
@@ -58,7 +58,7 @@ print("Computing test features (applying fitted TF-IDF SVD)...")
 test_feat_df, _ = compute_features(test_logs, tfidf_pipeline=tfidf_pipeline)
 test_df = test_feat_df.fillna(0)
 
-out_path = os.path.join(DATA_DIR, 'test_features_v4.csv')
+out_path = os.path.join(DATA_DIR, 'test_features_v6.csv')
 test_df.to_csv(out_path, index=False)
 print(f"  Saved {test_df.shape[0]} essays × {test_df.shape[1]} columns → {out_path}")
 

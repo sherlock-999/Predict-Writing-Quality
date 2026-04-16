@@ -1,23 +1,26 @@
 """
-Inference: Predict Essay Scores — Kaggle Submission (CatBoost, v4 features)
+Inference: Predict Essay Scores — Kaggle Submission (CatBoost, v6 features)
 ============================================================================
 Self-contained script: all feature engineering logic is inlined.
 No local module imports required.
 
-Feature set: v4_features (152 features = v2 base 119 + 33 new)
-  - Per-word normalised counts (same as v2)
-  - NEW cat 9: readability (ARI, Coleman-Liau), structural consistency (8 features)
-  - NEW cat 10: revision timing — where in session did deletions occur (5 features)
-  - NEW cat 11: TF-IDF SVD — 20 components of char 2–4-gram TF-IDF on
-                reconstructed text (captures punctuation rhythm)
+Feature set: v6_features (226 features = v5 206 + 20 new)
+  v5 base (206): extended activity/text_change/down_event/up_event counts,
+    n_unique_activity/up_event, input_word_length_median, action_time_min,
+    full up_time stats, cursor_position_min, full word_count stats,
+    per-word normalisations for all new counts
+  v6 new (20): Event TF-IDF SVD — word 1–5-gram on down_event sequence
 
-The TF-IDF SVD pipeline must be saved as tfidf_svd.pkl by precompute_features.py.
-It is loaded from MODELS_DIR so train and test use the same transformer.
+Two TF-IDF SVD pipelines loaded at inference time:
+  TFIDF_PATH       — char 2–4-gram on reconstructed essay text
+  EVENT_TFIDF_PATH — word 1–5-gram on down_event sequence
 
 Paths (Kaggle notebook environment):
-    DATA_DIR   = /kaggle/input/competitions/linking-writing-processes-to-writing-quality
-    MODELS_DIR = /kaggle/input/datasets/sherlocked999/writing-quality-catboost-v4
-    OUTPUT_PATH = submission.csv
+    DATA_DIR         = /kaggle/input/competitions/linking-writing-processes-to-writing-quality
+    MODELS_DIR       = /kaggle/input/datasets/sherlocked999/writing-quality-catboost-v6
+    TFIDF_PATH       = /kaggle/input/datasets/sherlocked999/tfidf-more/tfidf_v6/tfidf_svd.pkl
+    EVENT_TFIDF_PATH = /kaggle/input/datasets/sherlocked999/tfidf-more/tfidf_v6/event_tfidf_svd.pkl
+    OUTPUT_PATH      = submission.csv
 """
 
 import re
@@ -29,18 +32,21 @@ from catboost import CatBoostRegressor
 from scipy.stats import skew as _skew
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_DIR    = '/kaggle/input/competitions/linking-writing-processes-to-writing-quality'
-MODELS_DIR  = '/kaggle/input/datasets/sherlocked999/writing-quality-catboost-v4'
-TFIDF_PATH  = f'{MODELS_DIR}/tfidf/tfidf_svd.pkl'
-OUTPUT_PATH = 'submission.csv'
+DATA_DIR         = '/kaggle/input/competitions/linking-writing-processes-to-writing-quality'
+MODELS_DIR       = '/kaggle/input/datasets/sherlocked999/writing-quality-catboost-v6'
+TFIDF_PATH       = '/kaggle/input/datasets/sherlocked999/tfidf-more/tfidf_v6/tfidf_svd.pkl'
+EVENT_TFIDF_PATH = '/kaggle/input/datasets/sherlocked999/tfidf-more/tfidf_v6/event_tfidf_svd.pkl'
+OUTPUT_PATH      = 'submission.csv'
 
 # ── TF-IDF config (must match training) ──────────────────────────────────────
-TFIDF_N_COMPONENTS = 20
-TFIDF_SVD_COLS     = [f'tfidf_svd_{i}' for i in range(TFIDF_N_COMPONENTS)]
+TFIDF_N_COMPONENTS       = 20
+TFIDF_SVD_COLS           = [f'tfidf_svd_{i}'       for i in range(TFIDF_N_COMPONENTS)]
+EVENT_TFIDF_N_COMPONENTS = 20
+EVENT_TFIDF_SVD_COLS     = [f'event_tfidf_svd_{i}' for i in range(EVENT_TFIDF_N_COMPONENTS)]
 
 
 # =============================================================================
-# FEATURE COLUMNS  (v4 — 152 features)
+# FEATURE COLUMNS  (v6 — 226 features)
 # =============================================================================
 
 FEATURE_COLS = [
@@ -57,7 +63,12 @@ FEATURE_COLS = [
     'input_word_length_mean',
     'input_word_length_max',
     'input_word_length_std',
+    'input_word_length_median',
     'input_word_length_skew',
+    'word_count_min',
+    'word_count_mean',
+    'word_count_max',
+    'word_count_sum',
     'word_count_std',
     'word_count_median',
     'word_count_q1',
@@ -112,9 +123,17 @@ FEATURE_COLS = [
     'dash_per_word',
     'question_per_word',
     'quote_per_word',
+    'doublequote_text_per_word',
+    'semicolon_text_per_word',
+    'equals_text_per_word',
+    'slash_text_per_word',
+    'backslash_text_per_word',
+    'colon_text_per_word',
+    'singlequote_per_word',
 
     # ── 5. TYPING SPEED & FLUENCY ─────────────────────────────────────────────
     'keys_per_second',
+    'action_time_min',
     'action_time_sum',
     'action_time_mean',
     'action_time_std',
@@ -126,8 +145,10 @@ FEATURE_COLS = [
     'q_text_per_word',
     'space_per_word',
     'space_text_per_word',
+    'n_unique_activity',
     'n_unique_text_change',
     'n_unique_down_event',
+    'n_unique_up_event',
 
     # ── 6. PAUSING BEHAVIOR ───────────────────────────────────────────────────
     'idle_largest_latency',
@@ -144,6 +165,7 @@ FEATURE_COLS = [
     # ── 7. REVISION BEHAVIOR ──────────────────────────────────────────────────
     'removecut_per_word',
     'backspace_per_word',
+    'delete_per_word',
     'r_burst_mean',
     'r_burst_std',
     'r_burst_median',
@@ -152,6 +174,8 @@ FEATURE_COLS = [
 
     # ── 8. PRODUCTION FLOW & NAVIGATION ──────────────────────────────────────
     'input_per_word',
+    'replace_per_word',
+    'paste_per_word',
     'nonproduction_per_word',
     'p_burst_per_word',
     'p_burst_mean',
@@ -162,14 +186,19 @@ FEATURE_COLS = [
     'p_burst_last',
     'product_to_keys',
     'session_duration_sec',
+    'cursor_position_min',
     'cursor_position_mean',
     'cursor_position_std',
     'cursor_position_median',
     'cursor_position_q1',
     'cursor_position_q3',
+    'cursor_position_max',
     'leftclick_per_word',
     'arrowleft_per_word',
     'arrowright_per_word',
+    'arrowdown_per_word',
+    'arrowup_per_word',
+    'unidentified_per_word',
     'down_time_min',
     'down_time_mean',
     'down_time_std',
@@ -178,9 +207,47 @@ FEATURE_COLS = [
     'down_time_q3',
     'down_time_max',
     'up_time_min',
+    'up_time_mean',
+    'up_time_std',
+    'up_time_median',
+    'up_time_q1',
+    'up_time_q3',
     'up_time_max',
 
-    # ── 9. READABILITY & STRUCTURAL CONSISTENCY ───────────────────────────────
+    # ── 9. UP EVENT COUNTS ────────────────────────────────────────────────────
+    'up_event_q_cnt',
+    'up_event_Space_cnt',
+    'up_event_Backspace_cnt',
+    'up_event_Shift_cnt',
+    'up_event_ArrowRight_cnt',
+    'up_event_Leftclick_cnt',
+    'up_event_ArrowLeft_cnt',
+    'up_event_period_cnt',
+    'up_event_comma_cnt',
+    'up_event_ArrowDown_cnt',
+    'up_event_ArrowUp_cnt',
+    'up_event_Enter_cnt',
+    'up_event_CapsLock_cnt',
+    'up_event_singlequote_cnt',
+    'up_event_Delete_cnt',
+    'up_event_Unidentified_cnt',
+
+    # ── 10. RAW ACTIVITY / EVENT COUNTS ──────────────────────────────────────
+    'activity_Replace_cnt',
+    'activity_Paste_cnt',
+    'text_change_doublequote_cnt',
+    'text_change_semicolon_cnt',
+    'text_change_equals_cnt',
+    'text_change_slash_cnt',
+    'text_change_backslash_cnt',
+    'text_change_colon_cnt',
+    'down_event_ArrowDown_cnt',
+    'down_event_ArrowUp_cnt',
+    'down_event_singlequote_cnt',
+    'down_event_Delete_cnt',
+    'down_event_Unidentified_cnt',
+
+    # ── 11. READABILITY & STRUCTURAL CONSISTENCY ─────────────────────────────
     'ari_score',
     'coleman_liau_score',
     'sent_len_std',
@@ -190,15 +257,18 @@ FEATURE_COLS = [
     'para_balance',
     'words_per_minute',
 
-    # ── 10. REVISION TIMING ───────────────────────────────────────────────────
+    # ── 12. REVISION TIMING ───────────────────────────────────────────────────
     'revision_ratio_early',
     'revision_ratio_mid',
     'revision_ratio_late',
     'revision_timing_mean',
     'revision_timing_std',
 
-    # ── 11. TF-IDF SVD (char bigrams on reconstructed text) ──────────────────
-    *TFIDF_SVD_COLS,   # tfidf_svd_0 … tfidf_svd_19
+    # ── 13. TEXT TF-IDF SVD ───────────────────────────────────────────────────
+    *TFIDF_SVD_COLS,         # tfidf_svd_0 … tfidf_svd_19
+
+    # ── 14. EVENT TF-IDF SVD ─────────────────────────────────────────────────
+    *EVENT_TFIDF_SVD_COLS,   # event_tfidf_svd_0 … event_tfidf_svd_19
 ]
 
 
@@ -212,6 +282,7 @@ def _count_features(essay: pd.DataFrame) -> dict:
     act = essay['activity']
     tc  = essay['text_change']
     de  = essay['down_event']
+    ue  = essay['up_event']
 
     feats = {}
 
@@ -219,38 +290,73 @@ def _count_features(essay: pd.DataFrame) -> dict:
         ('Input',         'activity_Input_cnt'),
         ('Remove/Cut',    'activity_RemoveCut_cnt'),
         ('Nonproduction', 'activity_Nonproduction_cnt'),
+        ('Replace',       'activity_Replace_cnt'),
+        ('Paste',         'activity_Paste_cnt'),
     ]:
         feats[key] = int((act == value).sum())
 
     for value, key in [
-        ('q',  'text_change_q_cnt'),
-        (' ',  'text_change_space_cnt'),
-        ('.',  'text_change_period_cnt'),
-        (',',  'text_change_comma_cnt'),
-        ('\n', 'text_change_newline_cnt'),
-        ("'",  'text_change_quote_cnt'),
-        ('-',  'text_change_dash_cnt'),
-        ('?',  'text_change_question_cnt'),
+        ('q',   'text_change_q_cnt'),
+        (' ',   'text_change_space_cnt'),
+        ('.',   'text_change_period_cnt'),
+        (',',   'text_change_comma_cnt'),
+        ('\n',  'text_change_newline_cnt'),
+        ("'",   'text_change_quote_cnt'),
+        ('-',   'text_change_dash_cnt'),
+        ('?',   'text_change_question_cnt'),
+        ('"',   'text_change_doublequote_cnt'),
+        (';',   'text_change_semicolon_cnt'),
+        ('=',   'text_change_equals_cnt'),
+        ('/',   'text_change_slash_cnt'),
+        ('\\',  'text_change_backslash_cnt'),
+        (':',   'text_change_colon_cnt'),
     ]:
         feats[key] = int((tc == value).sum())
 
     for value, key in [
-        ('q',          'down_event_q_cnt'),
-        ('Space',      'down_event_Space_cnt'),
-        ('Backspace',  'down_event_Backspace_cnt'),
-        ('Shift',      'down_event_Shift_cnt'),
-        ('ArrowRight', 'down_event_ArrowRight_cnt'),
-        ('Leftclick',  'down_event_Leftclick_cnt'),
-        ('ArrowLeft',  'down_event_ArrowLeft_cnt'),
-        ('.',          'down_event_period_cnt'),
-        (',',          'down_event_comma_cnt'),
-        ('Enter',      'down_event_Enter_cnt'),
-        ('CapsLock',   'down_event_CapsLock_cnt'),
+        ('q',            'down_event_q_cnt'),
+        ('Space',        'down_event_Space_cnt'),
+        ('Backspace',    'down_event_Backspace_cnt'),
+        ('Shift',        'down_event_Shift_cnt'),
+        ('ArrowRight',   'down_event_ArrowRight_cnt'),
+        ('Leftclick',    'down_event_Leftclick_cnt'),
+        ('ArrowLeft',    'down_event_ArrowLeft_cnt'),
+        ('.',            'down_event_period_cnt'),
+        (',',            'down_event_comma_cnt'),
+        ('Enter',        'down_event_Enter_cnt'),
+        ('CapsLock',     'down_event_CapsLock_cnt'),
+        ('ArrowDown',    'down_event_ArrowDown_cnt'),
+        ('ArrowUp',      'down_event_ArrowUp_cnt'),
+        ("'",            'down_event_singlequote_cnt'),
+        ('Delete',       'down_event_Delete_cnt'),
+        ('Unidentified', 'down_event_Unidentified_cnt'),
     ]:
         feats[key] = int((de == value).sum())
 
+    for value, key in [
+        ('q',            'up_event_q_cnt'),
+        ('Space',        'up_event_Space_cnt'),
+        ('Backspace',    'up_event_Backspace_cnt'),
+        ('Shift',        'up_event_Shift_cnt'),
+        ('ArrowRight',   'up_event_ArrowRight_cnt'),
+        ('Leftclick',    'up_event_Leftclick_cnt'),
+        ('ArrowLeft',    'up_event_ArrowLeft_cnt'),
+        ('.',            'up_event_period_cnt'),
+        (',',            'up_event_comma_cnt'),
+        ('ArrowDown',    'up_event_ArrowDown_cnt'),
+        ('ArrowUp',      'up_event_ArrowUp_cnt'),
+        ('Enter',        'up_event_Enter_cnt'),
+        ('CapsLock',     'up_event_CapsLock_cnt'),
+        ("'",            'up_event_singlequote_cnt'),
+        ('Delete',       'up_event_Delete_cnt'),
+        ('Unidentified', 'up_event_Unidentified_cnt'),
+    ]:
+        feats[key] = int((ue == value).sum())
+
+    feats['n_unique_activity']    = int(act.nunique())
     feats['n_unique_text_change'] = int(tc.nunique())
     feats['n_unique_down_event']  = int(de.nunique())
+    feats['n_unique_up_event']    = int(ue.nunique())
 
     return feats
 
@@ -267,11 +373,12 @@ def _input_word_features(essay: pd.DataFrame) -> dict:
     lengths   = [len(w) for w in word_seqs]
 
     return {
-        'input_word_count':        len(lengths),
-        'input_word_length_mean':  np.mean(lengths)      if lengths else 0.0,
-        'input_word_length_max':   np.max(lengths)       if lengths else 0.0,
-        'input_word_length_std':   np.std(lengths)       if lengths else 0.0,
-        'input_word_length_skew':  float(_skew(lengths)) if lengths else 0.0,
+        'input_word_count':         len(lengths),
+        'input_word_length_mean':   np.mean(lengths)      if lengths else 0.0,
+        'input_word_length_max':    np.max(lengths)       if lengths else 0.0,
+        'input_word_length_std':    np.std(lengths)       if lengths else 0.0,
+        'input_word_length_median': np.median(lengths)    if lengths else 0.0,
+        'input_word_length_skew':   float(_skew(lengths)) if lengths else 0.0,
     }
 
 
@@ -281,6 +388,7 @@ def _timing_features(essay: pd.DataFrame) -> dict:
     feats = {}
 
     at = essay['action_time']
+    feats['action_time_min']    = float(at.min())
     feats['action_time_sum']    = float(at.sum())
     feats['action_time_mean']   = float(at.mean())
     feats['action_time_std']    = float(at.std())
@@ -299,17 +407,28 @@ def _timing_features(essay: pd.DataFrame) -> dict:
     feats['down_time_max']    = float(dt.max())
 
     ut = essay['up_time']
-    feats['up_time_min'] = float(ut.min())
-    feats['up_time_max'] = float(ut.max())
+    feats['up_time_min']    = float(ut.min())
+    feats['up_time_mean']   = float(ut.mean())
+    feats['up_time_std']    = float(ut.std())
+    feats['up_time_median'] = float(ut.median())
+    feats['up_time_q1']     = float(ut.quantile(0.25))
+    feats['up_time_q3']     = float(ut.quantile(0.75))
+    feats['up_time_max']    = float(ut.max())
 
     cp = essay['cursor_position']
+    feats['cursor_position_min']    = float(cp.min())
     feats['cursor_position_mean']   = float(cp.mean())
     feats['cursor_position_std']    = float(cp.std())
     feats['cursor_position_median'] = float(cp.median())
     feats['cursor_position_q1']     = float(cp.quantile(0.25))
     feats['cursor_position_q3']     = float(cp.quantile(0.75))
+    feats['cursor_position_max']    = float(cp.max())
 
     wc = essay['word_count']
+    feats['word_count_min']    = float(wc.min())
+    feats['word_count_mean']   = float(wc.mean())
+    feats['word_count_max']    = float(wc.max())
+    feats['word_count_sum']    = float(wc.sum())
     feats['word_count_std']    = float(wc.std())
     feats['word_count_median'] = float(wc.median())
     feats['word_count_q1']     = float(wc.quantile(0.25))
@@ -510,35 +629,48 @@ def _efficiency_features(essay: pd.DataFrame, essay_text: str) -> dict:
 def _normalize_counts(row: dict) -> dict:
     word_count = max(row.get('word_len_count', 1), 1)
     return {
-        'comma_per_word':        row.get('down_event_comma_cnt', 0)       / word_count,
-        'comma_text_per_word':   row.get('text_change_comma_cnt', 0)      / word_count,
-        'period_per_word':       row.get('down_event_period_cnt', 0)      / word_count,
-        'period_text_per_word':  row.get('text_change_period_cnt', 0)     / word_count,
-        'enter_per_word':        row.get('down_event_Enter_cnt', 0)       / word_count,
-        'newline_per_word':      row.get('text_change_newline_cnt', 0)    / word_count,
-        'shift_per_word':        row.get('down_event_Shift_cnt', 0)       / word_count,
-        'capslock_per_word':     row.get('down_event_CapsLock_cnt', 0)    / word_count,
-        'dash_per_word':         row.get('text_change_dash_cnt', 0)       / word_count,
-        'question_per_word':     row.get('text_change_question_cnt', 0)   / word_count,
-        'quote_per_word':        row.get('text_change_quote_cnt', 0)      / word_count,
-        'q_keys_per_word':       row.get('down_event_q_cnt', 0)           / word_count,
-        'q_text_per_word':       row.get('text_change_q_cnt', 0)          / word_count,
-        'space_per_word':        row.get('down_event_Space_cnt', 0)       / word_count,
-        'space_text_per_word':   row.get('text_change_space_cnt', 0)      / word_count,
-        'pauses_half_per_word':  row.get('pauses_half_sec', 0)            / word_count,
-        'pauses_1_per_word':     row.get('pauses_1_sec', 0)               / word_count,
-        'pauses_1half_per_word': row.get('pauses_1_half_sec', 0)          / word_count,
-        'pauses_2_per_word':     row.get('pauses_2_sec', 0)               / word_count,
-        'pauses_3_per_word':     row.get('pauses_3_sec', 0)               / word_count,
-        'removecut_per_word':    row.get('activity_RemoveCut_cnt', 0)     / word_count,
-        'backspace_per_word':    row.get('down_event_Backspace_cnt', 0)   / word_count,
-        'input_per_word':        row.get('activity_Input_cnt', 0)         / word_count,
-        'nonproduction_per_word':row.get('activity_Nonproduction_cnt', 0) / word_count,
-        'leftclick_per_word':    row.get('down_event_Leftclick_cnt', 0)   / word_count,
-        'arrowleft_per_word':    row.get('down_event_ArrowLeft_cnt', 0)   / word_count,
-        'arrowright_per_word':   row.get('down_event_ArrowRight_cnt', 0)  / word_count,
-        'sent_per_word':         row.get('sent_count', 0)                 / word_count,
-        'p_burst_per_word':      row.get('p_burst_count', 0)              / word_count,
+        'comma_per_word':            row.get('down_event_comma_cnt', 0)              / word_count,
+        'comma_text_per_word':       row.get('text_change_comma_cnt', 0)             / word_count,
+        'period_per_word':           row.get('down_event_period_cnt', 0)             / word_count,
+        'period_text_per_word':      row.get('text_change_period_cnt', 0)            / word_count,
+        'enter_per_word':            row.get('down_event_Enter_cnt', 0)              / word_count,
+        'newline_per_word':          row.get('text_change_newline_cnt', 0)           / word_count,
+        'shift_per_word':            row.get('down_event_Shift_cnt', 0)              / word_count,
+        'capslock_per_word':         row.get('down_event_CapsLock_cnt', 0)           / word_count,
+        'dash_per_word':             row.get('text_change_dash_cnt', 0)              / word_count,
+        'question_per_word':         row.get('text_change_question_cnt', 0)          / word_count,
+        'quote_per_word':            row.get('text_change_quote_cnt', 0)             / word_count,
+        'doublequote_text_per_word': row.get('text_change_doublequote_cnt', 0)       / word_count,
+        'semicolon_text_per_word':   row.get('text_change_semicolon_cnt', 0)         / word_count,
+        'equals_text_per_word':      row.get('text_change_equals_cnt', 0)            / word_count,
+        'slash_text_per_word':       row.get('text_change_slash_cnt', 0)             / word_count,
+        'backslash_text_per_word':   row.get('text_change_backslash_cnt', 0)         / word_count,
+        'colon_text_per_word':       row.get('text_change_colon_cnt', 0)             / word_count,
+        'singlequote_per_word':      row.get('down_event_singlequote_cnt', 0)        / word_count,
+        'q_keys_per_word':           row.get('down_event_q_cnt', 0)                  / word_count,
+        'q_text_per_word':           row.get('text_change_q_cnt', 0)                 / word_count,
+        'space_per_word':            row.get('down_event_Space_cnt', 0)              / word_count,
+        'space_text_per_word':       row.get('text_change_space_cnt', 0)             / word_count,
+        'pauses_half_per_word':      row.get('pauses_half_sec', 0)                   / word_count,
+        'pauses_1_per_word':         row.get('pauses_1_sec', 0)                      / word_count,
+        'pauses_1half_per_word':     row.get('pauses_1_half_sec', 0)                 / word_count,
+        'pauses_2_per_word':         row.get('pauses_2_sec', 0)                      / word_count,
+        'pauses_3_per_word':         row.get('pauses_3_sec', 0)                      / word_count,
+        'removecut_per_word':        row.get('activity_RemoveCut_cnt', 0)            / word_count,
+        'backspace_per_word':        row.get('down_event_Backspace_cnt', 0)          / word_count,
+        'delete_per_word':           row.get('down_event_Delete_cnt', 0)             / word_count,
+        'input_per_word':            row.get('activity_Input_cnt', 0)                / word_count,
+        'replace_per_word':          row.get('activity_Replace_cnt', 0)              / word_count,
+        'paste_per_word':            row.get('activity_Paste_cnt', 0)                / word_count,
+        'nonproduction_per_word':    row.get('activity_Nonproduction_cnt', 0)        / word_count,
+        'leftclick_per_word':        row.get('down_event_Leftclick_cnt', 0)          / word_count,
+        'arrowleft_per_word':        row.get('down_event_ArrowLeft_cnt', 0)          / word_count,
+        'arrowright_per_word':       row.get('down_event_ArrowRight_cnt', 0)         / word_count,
+        'arrowdown_per_word':        row.get('down_event_ArrowDown_cnt', 0)          / word_count,
+        'arrowup_per_word':          row.get('down_event_ArrowUp_cnt', 0)            / word_count,
+        'unidentified_per_word':     row.get('down_event_Unidentified_cnt', 0)       / word_count,
+        'sent_per_word':             row.get('sent_count', 0)                        / word_count,
+        'p_burst_per_word':          row.get('p_burst_count', 0)                     / word_count,
     }
 
 
@@ -613,17 +745,27 @@ def _revision_timing_features(essay: pd.DataFrame) -> dict:
     }
 
 
+# ── Token replacement map for event TF-IDF ───────────────────────────────────
+_REPLACE_MAP = {'.': 'period', ',': 'comma', "'": 'singlequote'}
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-def compute_features(logs: pd.DataFrame, tfidf_pipeline) -> pd.DataFrame:
+def compute_features(
+    logs: pd.DataFrame,
+    tfidf_pipeline,
+    event_tfidf_pipeline,
+) -> pd.DataFrame:
     """
-    Compute v4 per-essay features.
+    Compute v6 per-essay features.
 
     Parameters
     ----------
-    logs : pd.DataFrame   — raw keystroke logs
-    tfidf_pipeline        — fitted sklearn Pipeline (TF-IDF + TruncatedSVD);
-                            loaded from tfidf_svd.pkl in MODELS_DIR
+    logs : pd.DataFrame        — raw keystroke logs
+    tfidf_pipeline             — fitted sklearn Pipeline (char TF-IDF + TruncatedSVD);
+                                 loaded from tfidf_svd.pkl
+    event_tfidf_pipeline       — fitted sklearn Pipeline (word TF-IDF on down_event
+                                 sequence + TruncatedSVD); loaded from event_tfidf_svd.pkl
 
     Returns
     -------
@@ -631,8 +773,9 @@ def compute_features(logs: pd.DataFrame, tfidf_pipeline) -> pd.DataFrame:
     """
     logs = logs.sort_values(['id', 'event_id']).reset_index(drop=True)
 
-    rows  = []
-    texts = {}
+    rows       = []
+    texts      = {}
+    event_seqs = {}
 
     for essay_id, essay in logs.groupby('id'):
         essay = essay.reset_index(drop=True)
@@ -648,6 +791,11 @@ def compute_features(logs: pd.DataFrame, tfidf_pipeline) -> pd.DataFrame:
         non_nonproduction = essay[essay['activity'] != 'Nonproduction']
         text = _reconstruct_essay(non_nonproduction)
         texts[essay_id] = text
+
+        # Build event sequence for event TF-IDF
+        event_seqs[essay_id] = ' '.join(
+            _REPLACE_MAP.get(e, e) for e in essay['down_event'].astype(str)
+        )
 
         row.update(_word_features(text))
         row.update(_sentence_features(text))
@@ -666,22 +814,33 @@ def compute_features(logs: pd.DataFrame, tfidf_pipeline) -> pd.DataFrame:
 
     df = pd.DataFrame(rows).fillna(0)
 
-    # Apply the pre-fitted TF-IDF SVD (transform only — no fitting on test data)
+    # Apply pre-fitted text TF-IDF SVD
     corpus     = [texts[eid] for eid in df['id']]
     svd_matrix = tfidf_pipeline.transform(corpus)
     svd_df     = pd.DataFrame(svd_matrix, columns=TFIDF_SVD_COLS)
     svd_df['id'] = df['id'].values
     df = df.merge(svd_df, on='id', how='left')
 
+    # Apply pre-fitted event TF-IDF SVD
+    event_corpus      = [event_seqs[eid] for eid in df['id']]
+    event_svd_matrix  = event_tfidf_pipeline.transform(event_corpus)
+    event_svd_df      = pd.DataFrame(event_svd_matrix, columns=EVENT_TFIDF_SVD_COLS)
+    event_svd_df['id'] = df['id'].values
+    df = df.merge(event_svd_df, on='id', how='left')
+
     return df[['id'] + FEATURE_COLS].fillna(0)
 
 
 # =============================================================================
-# SECTION 1 – LOAD TF-IDF PIPELINE
+# SECTION 1 – LOAD TF-IDF PIPELINES
 # =============================================================================
-print(f"Loading TF-IDF SVD pipeline from {TFIDF_PATH}...")
+print(f"Loading text TF-IDF SVD pipeline from {TFIDF_PATH}...")
 with open(TFIDF_PATH, 'rb') as f:
     tfidf_pipeline = pickle.load(f)
+
+print(f"Loading event TF-IDF SVD pipeline from {EVENT_TFIDF_PATH}...")
+with open(EVENT_TFIDF_PATH, 'rb') as f:
+    event_tfidf_pipeline = pickle.load(f)
 
 # =============================================================================
 # SECTION 2 – LOAD CATBOOST MODELS
@@ -707,8 +866,8 @@ print("Loading test_logs.csv...")
 logs = pd.read_csv(f'{DATA_DIR}/test_logs.csv')
 print(f"  {logs.shape[0]:,} rows | {logs['id'].nunique()} essays")
 
-print("Computing per-essay features (v4)...")
-test_df = compute_features(logs, tfidf_pipeline).fillna(0)
+print("Computing per-essay features (v6)...")
+test_df = compute_features(logs, tfidf_pipeline, event_tfidf_pipeline).fillna(0)
 X_test  = test_df[FEATURE_COLS].values
 print(f"  Feature matrix: {X_test.shape[0]} essays × {X_test.shape[1]} features")
 
